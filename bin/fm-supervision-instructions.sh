@@ -153,7 +153,7 @@ repair_line() {
       printf '%s%s\n' "$prefix" 'watcher supervision is owned by the stop-hook park; inspect the hook registration and watcher startup path before ending the turn.'
       ;;
     antigravity)
-      printf '%s%s\n' "$prefix" 'repair missing watcher supervision with bin/fm-watch.sh as one foreground Antigravity terminal tool call, never shell &.'
+      printf '%s%s%s%s\n' "$prefix" 'repair missing watcher supervision with a foreground checkpoint: bin/fm-watch-checkpoint.sh --seconds ' "$checkpoint_seconds" '.'
       ;;
     *)
       printf '%s%s\n' "$prefix" 'repair missing watcher supervision according to the session-start block for this harness; do not use shell &.'
@@ -182,7 +182,7 @@ ordinary_wake_line() {
       printf '%s\n' '- Ordinary wake: the stop-hook park (bin/fm-turnend-guard-cursor.sh) already owns watcher continuity; drain and handle the wake, and do not arm another cycle yourself.'
       ;;
     antigravity)
-      printf '%s\n' '- Ordinary wake: after draining, handling, and acknowledging it, invoke one new foreground bin/fm-watch.sh terminal tool call while supervision remains required.'
+      printf '%s\n' '- Ordinary wake: after draining and handling it, start the next foreground bin/fm-watch-checkpoint.sh checkpoint while supervision remains required.'
       ;;
     *)
       printf '%s\n' '- Ordinary wake: follow the continuation in the harness protocol below; do not use shell &.'
