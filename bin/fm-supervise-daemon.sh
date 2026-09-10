@@ -86,6 +86,9 @@
 #                                   supported as supervisor backends; the daemon
 #                                   refuses loudly at startup rather than trying
 #                                   tmux primitives against a non-tmux pane.
+#          FM_DAEMON_PRIMARY_HARNESS primary harness captured by fm-afk-launch
+#                                   before creating the daemon terminal; native
+#                                   launches may detect it from their ancestry.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -635,7 +638,7 @@ fm_daemon_primary_harness() {
 pane_is_busy() {  # <target> [backend]
   local target=$1 backend=${2:-tmux} native tail40 harness
   harness=$(fm_daemon_primary_harness)
-  native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)
+  native=$(fm_backend_busy_state "$backend" "$target" delivery 2>/dev/null)
   case "$native" in
     busy) return 0 ;;
   esac
@@ -1530,6 +1533,11 @@ fm_super_main() {
     rm -f "$LOCK/pid-identity" 2>/dev/null || true
     log "warn: could not record this daemon's process identity; the turn-end guard cannot recognize away-mode supervision"
   fi
+
+  # Resolve once, outside command-substitution callers, and keep the primary's
+  # explicit launch identity instead of repeatedly detecting the daemon shell.
+  FM_DAEMON_PRIMARY_HARNESS=$(fm_daemon_primary_harness)
+  export FM_DAEMON_PRIMARY_HARNESS
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
   # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1

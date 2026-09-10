@@ -19,7 +19,7 @@ It is verified for crewmates, scouts, second mates, and interactive primary sess
 | Interrupt | One `Escape`; the active turn cancels and the TUI remains open. |
 | Exit | `/quit`, then one Enter. |
 | Skills | Antigravity automatically discovers skills under `.agents/skills/` from the added workspace. |
-| Primary | One foreground `bin/fm-watch.sh` terminal call; see `../../../../../docs/supervision-protocols/antigravity.md`. |
+| Primary | Native checkpoint completion plus a bounded primary Stop backstop; see `../../../../../docs/supervision-protocols/antigravity.md`. |
 
 ## Version and sign-in
 
@@ -41,7 +41,7 @@ A bare command or path merely containing the substring `agy` is not accepted as 
 Antigravity discovers `.agents/hooks.json`, `AGENTS.md`, and `.agents/skills/` from a directory passed with `--add-dir`.
 Hook discovery is independent of the argument's position in the repeated `--add-dir` list.
 Hook commands run with the directory containing `hooks.json` as their working directory.
-The tracked root hook injects the normal startup reminder with `PreInvocation` and gates terminal/delegation tools with `PreToolUse`.
+The tracked root hook injects the normal startup reminder with `PreInvocation`, gates terminal/delegation tools with `PreToolUse`, and adapts primary `Stop` through `fm-antigravity-hook.sh`.
 For workers, `fm-spawn.sh` writes `state/<id>.antigravity-hooks/.agents/hooks.json` and adds that isolated overlay after the project path, so it never writes or replaces the project's own `.agents/hooks.json`.
 `fm-control.sh relaunch` retires the old hook file before arming a replacement generation, and cleanup removes the overlay directory.
 A raw launch command receives none of this task wiring and has no trusted semantic activity state.
@@ -60,8 +60,8 @@ Antigravity's `PreToolUse` input is `.toolCall.name` plus `.toolCall.args.Comman
 The tracked primary hooks adapt that native contract to Firstmate's watcher-arm, persistent-directory-change, and built-in delegation guards.
 Those guards are primary-scoped and remain inert in isolated worker copies where delegation is legitimate.
 A live Gemini turn on 1.1.26 identified the built-in delegation tools as `invoke_subagent` and `send_message`; both are denied by the guard's existing delegation-shape classification in a Firstmate primary.
-Antigravity hooks are synchronous and expose no verified asynchronous background-task-to-model wake.
-The primary therefore uses the named foreground supervision protocol rather than borrowing another harness's background mechanics.
+Antigravity hooks are synchronous, while terminal commands may become native tasks whose completion resumes the model.
+The primary follows the named checkpoint protocol and its native Stop backstop rather than borrowing another harness's background mechanics.
 Headless `--print` is not a primary host because it has no persistent conversation for later fleet notifications.
 
 ## Verification boundary

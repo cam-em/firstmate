@@ -56,7 +56,7 @@ cat > "$WORKSPACE/.agents/hooks.json" <<EOF
     "PreInvocation": [
       {
         "type": "command",
-        "command": "cat >> ../pre-invocation.jsonl; printf '\\n' >> ../pre-invocation.jsonl; printf '{}'"
+        "command": "cat >> ../pre-invocation.jsonl; printf '\\n' >> ../pre-invocation.jsonl; ../bin/fm-lock.sh >/dev/null; printf '{}'"
       }
     ]
   },
@@ -77,7 +77,7 @@ cat > "$WORKSPACE/.agents/hooks.json" <<EOF
     "Stop": [
       {
         "type": "command",
-        "command": "cat >> ../stop.jsonl; printf '\\n' >> ../stop.jsonl; printf '{\"decision\":\"stop\"}'"
+        "command": "bash ../record-stop.sh"
       }
     ]
   },
@@ -96,6 +96,16 @@ cat > "$WORKSPACE/.agents/hooks.json" <<EOF
   }
 }
 EOF
+cp "$ROOT/.agents/hooks.json" "$WORKSPACE/tracked-hooks.json"
+cat > "$WORKSPACE/record-stop.sh" <<'SH'
+#!/usr/bin/env bash
+payload=$(cat)
+printf '%s\n' "$payload" >> ../stop.jsonl
+command=$(jq -er '."firstmate-supervision-stop".Stop[0].command' ../tracked-hooks.json) || exit 1
+output=$(printf '%s' "$payload" | bash -c "$command")
+printf '%s\n' "$output" >> ../stop-decisions.jsonl
+printf '%s\n' "$output"
+SH
 cat > "$WORKSPACE/prompt.txt" <<EOF
 This is a non-destructive adapter verification.
 Read AGENTS.md and the live-antigravity-proof workspace skill.
@@ -110,7 +120,25 @@ git -C "$WORKSPACE" init -q
 HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
 [ -x "$HERDR_LAB_HELPER" ] || fail "Herdr lab helper is not executable: $HERDR_LAB_HELPER"
 HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name antigravity-live-e2e)
-trap '"$HERDR_LAB_HELPER" teardown "$HERDR_LAB_SESSION" >/dev/null 2>&1 || true; fm_test_cleanup' EXIT HUP INT TERM
+cleanup_live() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "${FM_TEST_ANTIGRAVITY_EVIDENCE_DIR:-}" ]; then
+    mkdir -p "$FM_TEST_ANTIGRAVITY_EVIDENCE_DIR"
+    cp "$WORKSPACE/stop.jsonl" "$WORKSPACE/stop-decisions.jsonl" "$WORKSPACE/pre-invocation.jsonl" \
+      "$FM_TEST_ANTIGRAVITY_EVIDENCE_DIR/" 2>/dev/null || true
+    printf '%s\n' "${explanation:-}" > "$FM_TEST_ANTIGRAVITY_EVIDENCE_DIR/background-explanation.json"
+    cp "$WORKSPACE/delivery.log" "$WORKSPACE/native-probes.jsonl" "$FM_TEST_ANTIGRAVITY_EVIDENCE_DIR/" 2>/dev/null || true
+    if [ -n "${pane:-}" ]; then
+      "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane read "$pane" --source recent --lines 100 --format text \
+        > "$FM_TEST_ANTIGRAVITY_EVIDENCE_DIR/final-screen.txt" 2>/dev/null || true
+    fi
+  fi
+  "$HERDR_LAB_HELPER" teardown "$HERDR_LAB_SESSION" || rc=1
+  fm_test_cleanup
+  exit "$rc"
+}
+trap cleanup_live EXIT HUP INT TERM
 "$HERDR_LAB_HELPER" provision "$HERDR_LAB_SESSION" >/dev/null \
   || fail "could not provision the isolated Herdr lab"
 
@@ -125,7 +153,7 @@ shell_quote() {
   printf '%s' "$1" | sed "s/'/'\\\\''/g"
   printf "'"
 }
-cmd="agy --dangerously-skip-permissions --add-dir $(shell_quote "$WORKSPACE") --model $(shell_quote "$MODEL") --effort $(shell_quote "$EFFORT") --prompt-interactive \"\$(cat $(shell_quote "$WORKSPACE/prompt.txt"))\""
+cmd="exec env FM_HOME=$(shell_quote "$WORKSPACE") FM_ROOT_OVERRIDE=$(shell_quote "$WORKSPACE") FM_STATE_OVERRIDE=$(shell_quote "$WORKSPACE/state") FM_WEDGE_ALARM_EXEC=discard agy --dangerously-skip-permissions --add-dir $(shell_quote "$WORKSPACE") --model $(shell_quote "$MODEL") --effort $(shell_quote "$EFFORT") --prompt-interactive \"\$(cat $(shell_quote "$WORKSPACE/prompt.txt"))\""
 "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane run "$pane" "$cmd" >/dev/null \
   || fail "could not launch Antigravity"
 
@@ -162,6 +190,61 @@ agent=$("$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" agent get "$pane" 2>/dev/nu
 [ "$agent" = agy ] || fail "Herdr did not identify the live process as agy"
 printf '%s' "$capture" | grep -qi 'Gemini' || fail "the TUI did not display a Gemini model"
 printf '%s' "$capture" | grep -qi "$EFFORT" || fail "the TUI did not display effort '$EFFORT'"
+
+# Reproduce the primary delivery boundary with a real unrelated background
+# command, then prove native Stop resumes execution without another user input.
+export FM_HOME="$WORKSPACE" FM_ROOT_OVERRIDE="$WORKSPACE" FM_STATE_OVERRIDE="$WORKSPACE/state"
+. "$ROOT/bin/fm-supervise-daemon.sh"
+. "$ROOT/bin/fm-wake-lib.sh"
+fm_backend_source herdr
+fm_backend_herdr_cli() {
+  local session=$1 result rc=0
+  shift
+  [ "$session" = "$HERDR_LAB_SESSION" ] || return 1
+  result=$("$HERDR_LAB_HELPER" run "$session" "$@") || rc=$?
+  case "$1 $2" in
+    'agent get'|'agent explain') printf '%s\n' "$result" >> "$WORKSPACE/native-probes.jsonl" ;;
+  esac
+  printf '%s\n' "$result"
+  return "$rc"
+}
+export FM_SUPERVISOR_TARGET="$HERDR_LAB_SESSION:$pane" FM_SUPERVISOR_BACKEND=herdr FM_DAEMON_PRIMARY_HARNESS=antigravity
+LOG="$WORKSPACE/delivery.log"
+background_prompt='Use run_command to run sleep 120 with WaitMsBeforeAsync=500. Leave it running in the background, then reply BACKGROUND_READY and stop. This is an isolated verification, not real project work.'
+[ "$(fm_backend_herdr_send_text_submit "$FM_SUPERVISOR_TARGET" "$background_prompt" 3 0.5 0.5)" = empty ] \
+  || fail "Antigravity $version could not accept the background-job setup"
+for ((attempt=0; attempt<120; attempt++)); do
+  explanation=$(fm_backend_herdr_cli "$HERDR_LAB_SESSION" agent explain "$pane" --json 2>/dev/null || true)
+  if printf '%s' "$explanation" | jq -e '.matched_rule.id == "background_tasks_working"' >/dev/null 2>&1 \
+    && [ "$(fm_backend_composer_state herdr "$FM_SUPERVISOR_TARGET")" = empty ]; then break; fi
+  sleep 1
+done
+printf '%s' "$explanation" | jq -e '.matched_rule.id == "background_tasks_working"' >/dev/null \
+  || fail "Antigravity $version / Herdr $(herdr --version): no background-only native-working divergence observed"
+[ "$(fm_backend_busy_state herdr "$FM_SUPERVISOR_TARGET")" = busy ] || fail 'aggregate divergence became vacuous'
+! pane_is_busy "$FM_SUPERVISOR_TARGET" herdr || fail "Antigravity $version: background jobs still starve delivery"
+[ "$(fm_backend_composer_state herdr "$FM_SUPERVISOR_TARGET")" = empty ] || fail 'background footer hid the real prompt'
+# The Stop continuation, not another injected user message, must create the
+# successor. The synthetic task keeps supervision required without real work.
+printf 'kind=scout\n' > "$WORKSPACE/state/synthetic.meta"
+continuation_prompt="Reply STOP_PROBE and stop now without tools. If a system message subsequently says Firstmate supervision required: work remains in flight, run exactly FM_POLL=1 FM_HEARTBEAT=99999 '$ROOT/bin/fm-watch-checkpoint.sh' --seconds 30 with run_command WaitMsBeforeAsync=500, then stop again. This is the entire verification task; do not inspect any real fleet or start other work."
+touch "$WORKSPACE/state/.afk"
+inject_msg "$continuation_prompt" "$WORKSPACE/state" || fail "Antigravity $version: real background-idle injection was not confirmed"
+rm -f "$WORKSPACE/state/.afk"
+for ((attempt=0; attempt<120; attempt++)); do
+  if jq -se 'map(.decision) | index("continue") as $i | $i != null and .[$i+1] == "stop"' \
+      "$WORKSPACE/stop-decisions.jsonl" >/dev/null 2>&1 \
+    && fm_watcher_healthy "$WORKSPACE/state" "$ROOT/bin/fm-watch.sh" 300 "$WORKSPACE"; then break; fi
+  sleep 1
+done
+jq -se 'any(.[]; .decision == "continue")' "$WORKSPACE/stop-decisions.jsonl" >/dev/null \
+  || fail "Antigravity $version: native Stop did not return a continuation for missing supervision"
+fm_watcher_healthy "$WORKSPACE/state" "$ROOT/bin/fm-watch.sh" 300 "$WORKSPACE" \
+  || fail "Antigravity $version: Stop continuation did not establish a real successor without human input"
+rm -f "$WORKSPACE/state/synthetic.meta"
+# Wait out this exact bounded checkpoint before the lab removes the primary.
+sleep 32
+pass "real Antigravity $version: background-only working accepts injection; native Stop restores a successor without human input"
 
 "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane send-text "$pane" /quit >/dev/null || true
 "$HERDR_LAB_HELPER" run "$HERDR_LAB_SESSION" pane send-keys "$pane" Enter >/dev/null || true

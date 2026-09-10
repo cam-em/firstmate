@@ -181,7 +181,13 @@ allow_supervised_stop() {
   exit 2
 }
 
-if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+# Collection is not delivery: an independently recorded overdue away-mode
+# escalation remains unhealthy even while a collector and fresh beacon exist.
+DELIVERY_OVERDUE=0
+if [ -e "$STATE/.afk" ] && [ -s "$STATE/.subsuper-inject-wedged" ]; then
+  DELIVERY_OVERDUE=1
+fi
+if [ "$DELIVERY_OVERDUE" -eq 0 ] && fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   allow_supervised_stop
 fi
 
@@ -194,7 +200,7 @@ fi
 # The beacon half of the predicate is deliberately unchanged: a daemon that
 # stops restarting its watcher still blocks once the beacon passes grace, and
 # a home with no daemon and no watcher blocks exactly as before.
-if [ "$FM_SUP_WATCHER_FRESH" = true ] && fm_afk_daemon_owns_supervision "$STATE"; then
+if [ "$DELIVERY_OVERDUE" -eq 0 ] && [ "$FM_SUP_WATCHER_FRESH" = true ] && fm_afk_daemon_owns_supervision "$STATE"; then
   allow_supervised_stop
 fi
 
@@ -210,7 +216,9 @@ block_stop() {
   {
     printf '●%s\n' "$rule"
     printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-    if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
+    if [ "$DELIVERY_OVERDUE" -eq 1 ]; then
+      printf '●  An away-mode escalation is overdue and has not been delivered; collector liveness does not prove supervision.\n'
+    elif [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
       printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
     elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
       printf '●  %s process-event source(s) registered, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_SOURCES" "$FM_SUP_BEACON_DESC"
@@ -285,6 +293,9 @@ budget_account_current_epoch() {
 
 autoarm_owns_recovery() {
   local pid role outcome age
+  # Stop-owned collection recovery cannot settle an outstanding away-mode
+  # delivery, even if its watcher has already recovered a fresh beacon.
+  [ "$DELIVERY_OVERDUE" -eq 0 ] || return 1
   fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && return 0
   # A live OPEN generation claim owns recovery: the ledger names a live,
   # identity-matched owner still arming that is not stuck (fm_autoarm_claim_open

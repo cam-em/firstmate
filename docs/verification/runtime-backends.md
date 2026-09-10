@@ -545,6 +545,10 @@ No reasoning-effort axis was found; `gemini --help` on 0.58.0 exposes no effort,
 
 ## Herdr
 
+Antigravity primary delivery was revalidated on 2026-09-10 UTC with Herdr 0.8.2 and Antigravity 1.2.0.
+[`antigravity.md`](antigravity.md#primary-delivery-and-native-stop-revalidation) owns the exact live command, output, background-only/native-generation divergence, and verification limits.
+Other Herdr harness mappings retain their existing evidence below; tmux uses the shared composer with foreground-process identity, while cmux, Orca, and Zellij expose no separated-composer identity proof and remain conservative.
+
 The compatibility floor is protocol 14.
 The whole real-Herdr lane's latest active verification uses both Herdr 0.7.4 protocol 16 and Herdr 0.8.0 protocol 19 on macOS aarch64, while focused Herdr 0.7.5 protocol 17, earlier protocol-16, protocol-14, and 0.7.3 evidence is retained where it defines current behavior or fallbacks.
 Protocol 17 keeps every protocol-16 feature gate satisfied; the event and workspace-move floors remain 16.

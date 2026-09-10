@@ -2715,10 +2715,52 @@ fm_backend_herdr_capture_ansi() {  # <target> <lines>
 # same commit. The muse `⟩` glyph this adapter's local bare-prompt pattern
 # silently omitted is exactly the drift class that consolidation removes.
 
-fm_backend_herdr_agent_identity_raw() {  # <session> <pane> -> <agent>\t<status>
-  local out
+fm_backend_herdr_agent_identity_raw() {  # <session> <pane> [aggregate|delivery] -> <agent>\t<status>
+  local out identity
   out=$(fm_backend_herdr_cli "$1" agent get "$2" 2>/dev/null) || return 1
-  printf '%s' "$out" | jq -r '[.result.agent.agent // "", .result.agent.agent_status // ""] | @tsv' 2>/dev/null
+  identity=$(printf '%s' "$out" | jq -r '[.result.agent.agent // "", .result.agent.agent_status // ""] | @tsv' 2>/dev/null) || return 1
+  if [ "${3:-aggregate}" = delivery ]; then
+    fm_backend_herdr_delivery_identity "$1" "$2" "$identity"
+  else
+    printf '%s' "$identity"
+  fi
+}
+
+# Delivery activity is NOT aggregate worker activity. Antigravity's native
+# working includes unrelated background jobs, including the watcher itself.
+# Only a fresh explanation proving the background-only rule, with the native
+# spinner and permission rules explicitly evaluated false, permits input-idle.
+# Unknown/new rules or an unreadable explanation remain unknown, never idle.
+# This single normalization feeds injection, composer proof, and Enter receipts;
+# watcher/task activity continues to use the unmodified aggregate vocabulary.
+fm_backend_herdr_delivery_identity() {  # <session> <pane> <identity>
+  local session=$1 pane=$2 identity=$3 agent status explanation activity
+  agent=${identity%%$'\t'*}
+  status=${identity#*$'\t'}
+  case "$agent:$status" in
+    agy:working|antigravity:working)
+      explanation=$(fm_backend_herdr_cli "$session" agent explain "$pane" --json 2>/dev/null) || explanation='{}'
+      activity=$(printf '%s' "$explanation" | jq -r '
+        if (.agent == "agy" or .agent == "antigravity") and .state == "working" then
+          if .matched_rule.id == "spinner_working" then "working"
+          elif .matched_rule.id == "background_tasks_working"
+            and any(.evaluated_rules[]?; .id == "spinner_working" and .matched == false)
+            and any(.evaluated_rules[]?; .id == "permission_prompt" and .matched == false)
+            and all(.evaluated_rules[]?; .id == "background_tasks_working" or .matched == false)
+          then "idle" else "unknown" end
+        else "unknown" end
+      ' 2>/dev/null) || activity=unknown
+      # Native detection and the TUI footer update independently. Either
+      # positive generation signal prevents injection and can acknowledge a
+      # new turn; a missing signal never supplies positive idle evidence.
+      if [ "$activity" != working ] \
+        && [ "$(fm_backend_herdr_rendered_busy_state "$session:$pane" antigravity)" = busy ]; then
+        activity=working
+      fi
+      printf '%s\t%s' "$agent" "$activity"
+      ;;
+    *) printf '%s' "$identity" ;;
+  esac
 }
 
 # fm_backend_herdr_composer_identity: the native agent identity/state probe
@@ -2726,7 +2768,7 @@ fm_backend_herdr_agent_identity_raw() {  # <session> <pane> -> <agent>\t<status>
 # primitive no other backend has natively.
 fm_backend_herdr_composer_identity() {  # <target> -> "<agent>\t<status>"
   fm_backend_herdr_parse_target "$1" || return 1
-  fm_backend_herdr_agent_identity_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE"
+  fm_backend_herdr_agent_identity_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" delivery
 }
 
 # fm_backend_herdr_composer_state: thin adapter - capture plus capabilities
@@ -2865,7 +2907,7 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 # through a whole turn.
 fm_backend_herdr_queued_enter_busy() {  # <target> <allow-rendered>
   local target=$1 allow_rendered=${2:-0} raw
-  raw=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+  raw=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" delivery)
   case "$raw" in
     working) printf 'busy'; return 0 ;;
   esac
@@ -2882,7 +2924,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
-  raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
+  raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" delivery)
   baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   # Typing never starts a turn, so a footer read taken after the literal send
@@ -3048,7 +3090,7 @@ fm_backend_herdr_endpoint_confirmed_gone() {  # <target>
 
 # fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status
 # value to the adapter's watcher busy|idle|unknown vocabulary. working ->
-# busy (actively generating); idle/done -> idle; blocked -> idle (a blocked
+# busy (aggregate work, not necessarily model generation); idle/done -> idle; blocked -> idle (a blocked
 # agent is stuck waiting on the human, not grinding - the watcher should
 # treat it like a stale pane needing attention, not suppress it as busy);
 # unknown/unparseable/empty -> unknown, the caller's cue to fall back to
@@ -3079,10 +3121,10 @@ fm_backend_herdr_classify_submit_agent_status() {  # <raw-agent_status>
 # server is live (e.g. fm_backend_herdr_send_text_submit, immediately after a
 # successful send-text), so re-checking server liveness on every poll would
 # only add latency without adding safety.
-fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
-  local session=$1 pane_id=$2 out
-  out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>/dev/null) || { printf ''; return 0; }
-  printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null
+fm_backend_herdr_agent_status_raw() {  # <session> <pane_id> [aggregate|delivery]
+  local identity
+  identity=$(fm_backend_herdr_agent_identity_raw "$1" "$2" "${3:-aggregate}") || { printf ''; return 0; }
+  printf '%s' "${identity#*$'\t'}"
 }
 
 # fm_backend_herdr_busy_state: semantic busy state from herdr's native
@@ -3090,10 +3132,10 @@ fm_backend_herdr_agent_status_raw() {  # <session> <pane_id>
 # gets real semantics" per the design report. See
 # fm_backend_herdr_classify_agent_status for the status->busy/idle/unknown
 # mapping.
-fm_backend_herdr_busy_state() {  # <target>
+fm_backend_herdr_busy_state() {  # <target> [aggregate|delivery]
   fm_backend_herdr_target_ready "$1" || { printf 'unknown'; return 0; }
   fm_backend_herdr_classify_agent_status \
-    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")"
+    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" "${2:-aggregate}")"
 }
 
 # fm_backend_herdr_wait_for_working: poll <session>:<pane_id>'s NATIVE
@@ -3149,7 +3191,7 @@ fm_backend_herdr_wait_for_working() {  # <session> <pane_id> <budget-seconds> <p
     if [ "$polls" -eq 1 ] || [ "$i" -gt 0 ]; then
       sleep "$interval"
     fi
-    raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
+    raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id" delivery)
     bs=$(fm_backend_herdr_classify_submit_agent_status "$raw")
     case "$bs" in
       busy) printf 'busy'; return 0 ;;

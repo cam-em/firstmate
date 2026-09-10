@@ -923,6 +923,37 @@ e2e_tmux() {
   rm -rf "$home_tmp" 2>/dev/null || true
 }
 
+unit_primary_harness_crosses_terminal() {
+  local st out
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-identity.XXXXXX")
+  mkdir -p "$st/state"
+  # shellcheck disable=SC2016 # Written for expansion by the detached entrypoint.
+  printf '#!/usr/bin/env bash\nprintf "%%s" "$FM_DAEMON_PRIMARY_HARNESS" > "$FM_HOME/observed-harness"\n' > "$st/entry"
+  chmod +x "$st/entry"
+  out=$(
+    unset FM_DAEMON_PRIMARY_HARNESS
+    # shellcheck disable=SC2031 # This isolated launch deliberately replaces the inherited home.
+    export ANTIGRAVITY_AGENT=1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state"
+    export FM_SUPERVISOR_TARGET=fixture:0 FM_SUPERVISOR_BACKEND=tmux FM_AFK_LAUNCH_ENTRY="$st/entry"
+    # shellcheck source=/dev/null
+    . "$LAUNCH"
+    # shellcheck disable=SC2329 # Called by the production launch dispatcher.
+    fm_afk_launch_commit_terminal() { return 0; }
+    # Execute the actual generated command with no inherited primary identity.
+    # shellcheck disable=SC2329 # Backend I/O seam; no real tmux operations.
+    tmux() { env -u ANTIGRAVITY_AGENT -u FM_DAEMON_PRIMARY_HARNESS bash -c "${@: -1}"; }
+    fm_afk_launch_start
+    cat "$st/observed-harness"
+  )
+  if [ "$out" = antigravity ]; then
+    pass 'launcher identity: detached daemon explicitly receives the primary harness'
+  else
+    fail "launcher identity: lost primary identity at the terminal boundary ($out)"
+  fi
+  rm -rf "$st"
+}
+
+unit_primary_harness_crosses_terminal
 unit_clear_stale
 unit_relative_paths_are_absolute_before_daemon_launch
 unit_fresh_vs_refresh

@@ -8,6 +8,15 @@
       }
     ]
   },
+  "firstmate-supervision-stop": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "../bin/fm-antigravity-hook.sh primary-stop",
+        "timeout": 60
+      }
+    ]
+  },
   "firstmate-shell-seatbelts": {
     "PreToolUse": [
       {
