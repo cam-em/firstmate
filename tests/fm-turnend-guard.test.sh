@@ -1800,11 +1800,23 @@ test_hook_away_daemon_allows_between_watcher_cycles() {
   expect_code 0 "$status" "away mode with a live daemon must not block between watcher cycles"
   [ -z "$out" ] || fail "away-mode daemon ownership still produced a block banner: $out"
   out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false); status=$?
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
   expect_code 0 "$status" "--claude away mode with a live daemon must not block between watcher cycles"
   [ -z "$out" ] || fail "--claude away-mode daemon ownership still produced a block banner: $out"
-  pass "fm-turnend-guard: a live away-mode daemon satisfies supervision with no watcher holding the lock"
+  # A live collector is not proof that an overdue escalation reached its
+  # consumer. Both a live daemon and an otherwise healthy watcher must defer.
+  record_watcher_lock "$dir" "$pid" "$(watcher_identity "$dir" "$pid")"
+  printf 'undelivered escalation\n' > "$dir/state/.subsuper-inject-wedged"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" 'overdue delivery must block despite collector liveness'
+  assert_contains "$out" 'overdue and has not been delivered' 'guard must explain the delivery failure'
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false); status=$?
+  expect_code 2 "$status" '--claude must not accept an overdue delivery as healthy'
+  rm -f "$dir/state/.subsuper-inject-wedged"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" 'confirmed delivery must restore healthy supervision'
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "fm-turnend-guard: live away-mode ownership is healthy only without an overdue delivery"
 }
 
 test_hook_away_daemon_allows_over_dead_watcher_lock() {

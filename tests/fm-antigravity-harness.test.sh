@@ -341,6 +341,132 @@ SH
   pass "fm-spawn.sh accepts Antigravity through the remote secondmate interface"
 }
 
+# Exercise the real Herdr adapter, shared composer, daemon guards, and submit
+# loop. Only the native terminal boundary is faked; the defect cannot be hidden
+# by stubbing busy_state or composer_state to the desired answer.
+test_background_delivery_boundary() (
+  local state FIXTURE_RULE=background_tasks_working FIXTURE_NATIVE=working FIXTURE_AGENT=agy FIXTURE_MODE=land out rc
+  state="$TMP_ROOT/delivery"
+  mkdir -p "$state"
+  export FM_HOME="$TMP_ROOT" FM_STATE_OVERRIDE="$state" FM_DAEMON_PRIMARY_HARNESS=antigravity
+  export FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET=fixture:w1:p1
+  export FM_BACKEND_HERDR_SUBMIT_POLLS=1 FM_BACKEND_HERDR_SUBMIT_MIN_SLEEP=0
+  export FM_INJECT_CONFIRM_SLEEP=0
+  . "$ROOT/bin/fm-supervise-daemon.sh"
+  fm_backend_source herdr
+  LOG="$state/log"
+  touch "$state/.afk" "$LOG"
+  screen_file="$state/screen"
+  initial=$(printf '%s\n' '────────────────────' '>' '────────────────────' \
+    '  ● [12:00:01] sleep 600 running' '  ↓ 5 more' '────────────────────' \
+    '? for shortcuts     Gemini 3.8 Flash · low · 9 task(s) · /tasks')
+  printf '%s\n' "$initial" > "$screen_file"
+  fm_backend_target_exists() { return 0; }
+  # shellcheck disable=SC2329 # Called through the production backend dispatcher.
+  fm_backend_herdr_target_ready() { fm_backend_herdr_parse_target "$1"; }
+  # shellcheck disable=SC2329 # Native I/O boundary used by the production adapter.
+  fm_backend_herdr_cli() {
+    shift
+    case "$1 $2" in
+      'agent get') jq -n --arg a "$FIXTURE_AGENT" --arg s "$FIXTURE_NATIVE" '{result:{agent:{agent:$a,agent_status:$s}}}' ;;
+      'agent explain')
+        [ "$FIXTURE_RULE" != unreadable ] || return 1
+        jq -n --arg rule "$FIXTURE_RULE" '{agent:"agy",state:"working",matched_rule:{id:$rule},evaluated_rules:[
+          {id:"permission_prompt",matched:($rule == "permission_prompt")},
+          {id:"spinner_working",matched:($rule == "spinner_working")},
+          {id:"background_tasks_working",matched:true}]}'
+        ;;
+      'pane read') cat "$screen_file" ;;
+      'pane send-text')
+        printf 'typed\n' >> "$state/sends"
+        printf '%s\n' "$initial" | sed 's/^>$/ > injected result/' > "$screen_file"
+        ;;
+      'pane send-keys')
+        printf 'enter\n' >> "$state/enters"
+        [ "$FIXTURE_MODE" != land ] || printf '%s\n' "$initial" > "$screen_file"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  [ "$(fm_backend_busy_state herdr fixture:w1:p1)" = busy ] || fail 'worker aggregate must remain busy'
+  [ "$(fm_backend_busy_state herdr fixture:w1:p1 delivery)" = idle ] || fail 'background-only activity must be input-idle'
+  [ "$(fm_backend_composer_state herdr fixture:w1:p1)" = empty ] || fail 'three-rule background footer hid the prompt'
+  printf 'actionable result\n' > "$state/.subsuper-escalations"
+  escalate_flush "$state" || fail 'background-only primary still starves injection'
+  [ ! -s "$state/.subsuper-escalations" ] || fail 'confirmed delivery did not retire buffer'
+  [ "$(wc -l < "$state/sends" | tr -d ' ')" = 1 ] || fail 'message must be typed once'
+  ! grep -q 'inject deferred' "$LOG" || fail 'background-only primary deferred'
+
+  # A swallowed Enter must NOT be confirmed by the unchanged aggregate working
+  # level, either through wait_for_working or the queued-Enter conversion.
+  FIXTURE_MODE=swallow
+  out=$(fm_backend_herdr_send_text_submit fixture:w1:p1 result 2 0 0)
+  [ "$out" = pending ] || fail "unchanged aggregate working falsely confirmed a swallowed Enter: $out"
+  [ "$(wc -l < "$state/sends" | tr -d ' ')" = 2 ] || fail 'Enter retry retyped the message'
+  [ "$(wc -l < "$state/enters" | tr -d ' ')" = 3 ] || fail 'swallowed Enter was not retried exactly once'
+  rc=0
+  printf 'another result\n' > "$state/.subsuper-escalations"
+  escalate_flush "$state" || rc=$?
+  [ "$rc" -ne 0 ] && [ -s "$state/.subsuper-escalations" ] || fail 'pending input lost its escalation obligation'
+  printf '%s\n' "$initial" > "$screen_file"
+  FIXTURE_RULE=spinner_working
+  pane_is_busy fixture:w1:p1 herdr || fail 'real native generation must defer'
+  FIXTURE_RULE=unreadable
+  [ "$(fm_backend_busy_state herdr fixture:w1:p1 delivery)" = unknown ] || fail 'missing explanation must be unknown'
+  [ "$(fm_backend_composer_state herdr fixture:w1:p1)" = unknown ] || fail 'missing explanation must not prove empty'
+  FIXTURE_RULE=new_unknown_rule
+  [ "$(fm_backend_composer_state herdr fixture:w1:p1)" = unknown ] || fail 'unrecognized rule must not prove empty'
+  FIXTURE_RULE=unreadable
+  printf '%s\nesc to cancel\n' "$initial" > "$screen_file"
+  [ "$(fm_backend_busy_state herdr fixture:w1:p1 delivery)" = busy ] || fail 'rendered generation must survive loss of native explanation'
+  pane_is_busy fixture:w1:p1 herdr || fail 'rendered generation must independently defer'
+  FIXTURE_RULE=background_tasks_working
+  printf '>\n' > "$screen_file"
+  [ "$(fm_backend_composer_state herdr fixture:w1:p1)" = unknown ] || fail 'dead shell accepted'
+  printf '%s\nChoose permission: yes/no\n' "$initial" > "$screen_file"
+  [ "$(fm_backend_composer_state herdr fixture:w1:p1)" = unknown ] || fail 'modal footer accepted'
+  FIXTURE_AGENT=pi
+  [ "$(fm_backend_busy_state herdr fixture:w1:p1 delivery)" = busy ] || fail 'Antigravity exception leaked into Pi'
+  pass 'delivery boundary: background-only injection lands once; genuine busy, pending, unknown, modal and shell remain protected'
+)
+
+test_primary_stop_backstop() (
+  local home shell out
+  home="$TMP_ROOT/stop-primary"
+  make_primary_fixture "$home"
+  shell="$home/agy"
+  ln -s /bin/bash "$shell"
+  # A real process with the harness executable path owns the fixture lock.
+  # No fake watcher or source-byte assertion can turn a fresh beacon into a
+  # live successor; the actual shared guard must reject that counterfactual.
+  run_stop() {
+    # shellcheck disable=SC2016 # Expanded by the real child shell owning .lock.
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$home/state" FM_WEDGE_ALARM_EXEC=discard \
+      "$shell" -c 'echo $$ > "$FM_HOME/state/.lock"; for execution in "$@"; do
+        printf "{\"conversationId\":\"fixture\",\"executionNum\":%s,\"fullyIdle\":false}" "$execution" |
+          "$FM_HOME/bin/fm-antigravity-hook.sh" primary-stop
+      done' agy "$@"
+  }
+  out=$(run_stop 1)
+  [ "$(printf '%s' "$out" | jq -r .decision)" = stop ] || fail "empty fleet must allow stop: $out"
+  touch "$home/state/task.meta" "$home/state/.last-watcher-beat"
+  out=$(run_stop 1 1 2 3 4 5)
+  [ "$(printf '%s' "$out" | jq -sr '[.[]|select(.decision == "continue")]|length')" = 4 ] \
+    || fail "native Stop must dedupe executionNum and bound repair continuations: $out"
+  [ "$(printf '%s' "$out" | jq -sr '.[0].reason')" = 'Firstmate supervision required: work remains in flight' ] \
+    || fail 'missing successor must return the native continuation reason'
+  [ -s "$home/state/.antigravity-stop-alarm.log" ] || fail 'exhausted continuation budget must produce independent failure evidence'
+  out=$(printf '{"conversationId":"foreign","executionNum":1,"fullyIdle":false}' | \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-antigravity-hook.sh" primary-stop)
+  [ "$out" = '{}' ] || fail 'foreign session must not control this home'
+  out=$(printf 'not json' | "$ROOT/bin/fm-antigravity-hook.sh" primary-stop)
+  [ "$out" = '{}' ] || fail 'malformed input must be inert'
+  pass 'primary Stop: native continuation, real owner scope, fresh-beacon negative, bounded repair and independent alarm'
+)
+
+test_background_delivery_boundary || exit 1
+if [ "${FM_TEST_ANTIGRAVITY_DELIVERY_ONLY:-0}" = 1 ]; then exit 0; fi
+test_primary_stop_backstop || exit 1
 test_marker_precedence_and_ai_agent_rejection
 test_exact_agy_ancestry_only
 test_control_and_busy_contracts

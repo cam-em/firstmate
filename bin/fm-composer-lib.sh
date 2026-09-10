@@ -1342,6 +1342,58 @@ fm_composer_queued_enter_verdict() {  # <composer-state> <busy|idle|unknown>
   fi
 }
 
+# Antigravity adds a THIRD separator below its background-job list. The last
+# separator pair then contains jobs, not input. Select the bounded pair whose
+# first row is the native `>` prompt and prove every following row is footer
+# furniture. Never skip arbitrary text, a later shell prompt, or a modal menu.
+# Native delivery identity is still required by the caller; footer text alone
+# can never promote a shell to an agent composer.
+_fm_composer_antigravity_select_pair() {  # <screen>
+  local plain row=0 open=-1 candidate=-1 close=-1 first='' line trimmed max=$FM_COMPOSER_PI_MAX_LINES
+  case "$max" in ''|*[!0-9]*|0) max=8 ;; esac
+  plain=$(printf '%s' "$1" | fm_composer_strip_ansi)
+  while IFS= read -r line; do
+    trimmed=$line
+    fm_composer_normalize_trim_var trimmed
+    if _fm_composer_pi_separator_row "$trimmed"; then
+      if [ "$open" -ge 0 ] && [ $((row - open)) -le $((max + 1)) ]; then
+        case "$first" in
+          '>'*) candidate=$open; close=$row ;;
+        esac
+      fi
+      open=$row
+      first=''
+    elif [ "$row" -eq $((open + 1)) ]; then
+      first=$trimmed
+    fi
+    row=$((row + 1))
+  done <<EOF
+$plain
+EOF
+  [ "$candidate" -ge 0 ] || return 1
+  row=0
+  while IFS= read -r line; do
+    if [ "$row" -gt "$close" ]; then
+      trimmed=$line
+      fm_composer_normalize_trim_var trimmed
+      if [ -n "$trimmed" ] && ! _fm_composer_pi_separator_row "$trimmed"; then
+        case "$trimmed" in
+          '? for shortcuts'*) ;;
+          *)
+            printf '%s\n' "$trimmed" | grep -qE '^● (\[[0-9:]+\] )?.+ running$|^↓ [0-9]+ more$' || return 1
+            ;;
+        esac
+      fi
+    fi
+    row=$((row + 1))
+  done <<EOF
+$plain
+EOF
+  FM_COMPOSER_SCAN_PI_OPEN=$candidate
+  FM_COMPOSER_SCAN_PI_CLOSE=$close
+  FM_COMPOSER_SCAN_PI_PAIR_VALID=1
+}
+
 _fm_composer_classify_pi_rows() {  # <screen> <styled> <agent>
   local screen=$1 styled=$2 agent=${3:-pi} row raw content glyph
   row=$((FM_COMPOSER_SCAN_PI_OPEN + 1))
@@ -1414,7 +1466,13 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   fi
   agent=${identity%%$'\t'*}
   agent_status=${identity#*$'\t'}
-  case "$agent" in pi|antigravity|agy) ;; *) printf 'unknown'; return 0 ;; esac
+  case "$agent" in
+    pi) ;;
+    antigravity|agy)
+      _fm_composer_antigravity_select_pair "$screen" || { printf 'unknown'; return 0; }
+      ;;
+    *) printf 'unknown'; return 0 ;;
+  esac
   if [ "$FM_COMPOSER_SCAN_PI_PAIR_VALID" != 1 ]; then
     printf 'unknown'
     return 0
@@ -1424,6 +1482,15 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
     printf 'pending'
     return 0
   fi
+  # Independent rendered generation evidence wins over an idle identity that
+  # raced a redraw. Background-job counts are deliberately not busy tokens.
+  case "$agent" in
+    antigravity|agy)
+      if printf '%s' "$screen" | fm_composer_strip_ansi | tail -12 | fm_busy_lines_match antigravity; then
+        printf 'unknown'; return 0
+      fi
+      ;;
+  esac
   case "$agent_status" in
     idle|done) printf 'empty' ;;
     *) printf 'unknown' ;;

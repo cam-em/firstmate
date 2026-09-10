@@ -788,7 +788,9 @@ fm_backend_worktree_path() {  # <backend> <worktree-id>
 # uses unknown as the cue for harness-scoped pane-tail detection, while
 # fm-crew-state.sh also corroborates native idle verdicts with the recorded
 # harness's signature before treating a no-run crew as not busy.
-fm_backend_busy_state() {  # <backend> <target>
+# The optional delivery purpose asks for interactive activity rather than
+# aggregate work; Herdr owns that distinction (notably Antigravity jobs).
+fm_backend_busy_state() {  # <backend> <target> [aggregate|delivery]
   local backend=$1
   shift
   fm_backend_source "$backend" || { printf 'unknown'; return 0; }

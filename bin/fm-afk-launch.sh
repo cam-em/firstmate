@@ -17,7 +17,8 @@
 # from its OWN inherited env (discover_supervisor_target). Running it in a
 # separate terminal would make it discover its OWN pane, so this captures the
 # captain pane FIRST (from the pane this script runs in) and passes it in as
-# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND explicitly.
+# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND and FM_DAEMON_PRIMARY_HARNESS
+# explicitly. The detached terminal's ancestry is not the primary's identity.
 #
 # Usage:
 #   fm-afk-launch.sh start     Capture the captain pane, then (unless the daemon
@@ -414,8 +415,8 @@ fm_afk_launch_create_herdr() {  # <captain-target> <captain-backend>
     IFS=$'\t' read -r wsid pane <<< "$recovered"
   fi
   entry=$(fm_afk_launch_entry_cmd)
-  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
-    "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
+  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q FM_DAEMON_PRIMARY_HARNESS=%q %q' \
+    "$FM_HOME" "$captain_target" "$captain_backend" "${FM_DAEMON_PRIMARY_HARNESS:-unknown}" "$entry")
   if ! fm_afk_launch_record_write herdr "$session:$pane" "$wsid"; then
     fm_afk_launch_log "failed to persist herdr daemon terminal record; closing $session:$pane"
     fm_afk_launch_close_terminal herdr "$session:$pane"
@@ -441,8 +442,8 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
   nonce="$$-${RANDOM:-0}-$(date '+%s')"
   session="fm-afk-daemon-$hash-$nonce"
   entry=$(fm_afk_launch_entry_cmd)
-  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
-    "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
+  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q FM_DAEMON_PRIMARY_HARNESS=%q %q' \
+    "$FM_HOME" "$captain_target" "$captain_backend" "${FM_DAEMON_PRIMARY_HARNESS:-unknown}" "$entry")
   if ! fm_afk_launch_record_write tmux "$session" ""; then
     fm_afk_launch_log "failed to persist planned tmux daemon session '$session'"
     return 1
@@ -464,7 +465,9 @@ fm_afk_launch_start() {
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
     return 1
   fi
-  # Capture the captain pane FIRST, before creating anything.
+  # Capture the primary's identity and pane FIRST, before creating anything.
+  FM_DAEMON_PRIMARY_HARNESS=${FM_DAEMON_PRIMARY_HARNESS:-$("$FM_AFK_LAUNCH_DIR/fm-harness.sh" 2>/dev/null || printf unknown)}
+  export FM_DAEMON_PRIMARY_HARNESS
   captain_target=$(discover_supervisor_target) || {
     fm_afk_launch_log "could not resolve the captain supervisor pane (set FM_SUPERVISOR_TARGET)"; return 1; }
   captain_backend=$(discover_supervisor_backend) || {

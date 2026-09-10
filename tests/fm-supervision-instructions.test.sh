@@ -124,17 +124,17 @@ test_antigravity_uses_foreground_terminal_supervision() {
   local out ordinary
   out=$("$RENDER" --harness antigravity)
   assert_contains "$out" "primary harness: antigravity" "Antigravity heading missing"
-  assert_contains "$out" "Mode: Antigravity foreground tool supervision." "Antigravity snippet missing"
-  assert_contains "$out" "invoke \`bin/fm-watch.sh\` as one foreground terminal tool call" \
-    "Antigravity protocol lost its foreground wait"
-  assert_contains "$out" "bin/fm-watch-arm.sh\` is not a valid substitute" \
-    "Antigravity protocol must explicitly reject the background arm"
+  assert_contains "$out" "Mode: Antigravity native checkpoint supervision with a bounded Stop backstop." "Antigravity snippet missing"
+  assert_contains "$out" "bin/fm-watch-checkpoint.sh" "Antigravity protocol lost its checkpoint"
+  assert_contains "$out" "Native task completion can resume the model" "Antigravity protocol lost its native completion semantics"
+  assert_contains "$out" "bin/fm-watch-arm.sh\` is not a substitute" \
+    "Antigravity protocol must explicitly reject the detached arm"
+  assert_contains "$out" "Firstmate supervision required: work remains in flight" "Antigravity protocol lost its Stop recovery instruction"
   ordinary=$(printf '%s\n' "$out" | grep -F -- '- Ordinary wake:')
-  assert_contains "$ordinary" "foreground bin/fm-watch.sh" "Antigravity ordinary continuation lost its foreground wait"
+  assert_contains "$ordinary" "bin/fm-watch-checkpoint.sh" "Antigravity ordinary continuation lost its checkpoint"
   out=$("$RENDER" --harness antigravity --repair-line)
-  assert_contains "$out" "bin/fm-watch.sh as one foreground Antigravity terminal tool call" \
-    "Antigravity repair line lost its verified wait shape"
-  pass "Antigravity supervision uses one foreground terminal-tool wait"
+  assert_contains "$out" "bin/fm-watch-checkpoint.sh --seconds" "Antigravity repair line lost its checkpoint"
+  pass "Antigravity supervision uses native checkpoints and a bounded Stop backstop"
 }
 
 test_pi_signed_preserves_identity_with_pi_supervision_protocol() {

@@ -71,9 +71,9 @@ A single Escape cancelled a live Gemini turn and left the interactive Antigravit
 Typing `/quit` and one Enter exited the TUI.
 Those mechanics are registered in `bin/fm-control-lib.sh`, so interrupt, exit, and transactional relaunch use the ordinary Firstmate control plane.
 
-Antigravity hooks are synchronous.
-No documented or live-verified interface lets a detached background process wake the model later.
-Primary and second-mate sessions therefore use the explicit foreground `bin/fm-watch.sh` terminal-tool protocol in `docs/supervision-protocols/antigravity.md` rather than borrowing another harness's extension, plugin, or background-task mechanics.
+Antigravity hooks are synchronous, but a terminal command can return asynchronously as a native task whose completion resumes the model.
+That native-task facility is not an arbitrary detached-process wake API and does not own successor scheduling.
+Primary and second-mate sessions follow `docs/supervision-protocols/antigravity.md`; the primary Stop backstop and live verification below supersede the earlier foreground-only assumption.
 Headless print mode is intentionally unsupported as a primary host because it does not preserve a conversation for later fleet notifications.
 
 ## Regressions and live guard
@@ -91,4 +91,36 @@ tests/fm-antigravity-live-e2e.test.sh
 ```
 
 The guard refuses a non-Gemini model, an old CLI, unavailable Herdr isolation, a missing instruction/skill sentinel, a missing autonomous terminal result, a missing hook result, a wrong project path, or a missing model/effort display.
+It also requires real background-only native-working divergence, a confirmed injection, and native Stop restoration of a real successor without another human prompt.
 It cannot pass merely because `agy` started.
+
+## Primary delivery and native Stop revalidation
+
+Date: 2026-09-10 UTC.
+Versions: Antigravity CLI 1.2.0, Herdr 0.8.2, Gemini `gemini-3.8-flash-low`, macOS arm64.
+
+```sh
+FM_TEST_SKIP_ORPHAN_REAP=1 \
+FM_TEST_ANTIGRAVITY_LIVE=1 \
+FM_TEST_ANTIGRAVITY_MODEL=gemini-3.8-flash-low \
+bin/fm-test-run.sh tests/fm-antigravity-live-e2e.test.sh
+```
+
+Observed output:
+
+```text
+ok - real Antigravity 1.2.0: background-only working accepts injection; native Stop restores a successor without human input
+ok - real Antigravity 1.2.0 used Gemini, workspace instructions and skill, autonomous tools, native hooks, model/effort, and agy identity
+```
+
+A real `sleep 120` native task kept Herdr's `background_tasks_working` rule matched after the model completed its response.
+The actual input row remained empty above the job list and its third separator.
+The repaired delivery path accepted one real escalation despite aggregate `working`, and the native Stop hook returned `continue` when synthetic in-flight work had no watcher.
+The following execution started a real bounded checkpoint without another injected message.
+Native Stop payloads reported `fullyIdle:false` both before and after that continuation, demonstrating why it cannot stand for primary model generation.
+Rendered `esc to cancel` also provided generation evidence while the native explanation still selected the background rule, so the two delivery signals must remain independent.
+The helper's default-session tripwire passed after lab cleanup.
+
+Portable counterfactuals retain aggregate task activity, remove each generation signal independently, keep unknown explanations unsafe, reject bare shells and modal footers, preserve human drafts, and prove an unchanged background `working` level cannot confirm a swallowed Enter.
+They also cover real-process session ownership, duplicate Stop execution numbers, a fresh beacon without a successor, bounded repair, and independent failure evidence.
+This verifies the corrected delivery boundary and one native successor-restoration cycle, not an overnight soak, exactly-once semantic handling, crash-proof task notifications, or a perpetual runtime-owned scheduler.

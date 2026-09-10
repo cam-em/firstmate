@@ -232,6 +232,9 @@ tests/fm-crew-state.test.sh
 
 ## Turn-end guard
 
+The native Antigravity Stop transport was revalidated on 2026-09-10 UTC with Antigravity 1.2.0 and Herdr 0.8.2.
+[`antigravity.md`](antigravity.md#primary-delivery-and-native-stop-revalidation) owns the exact live command and output proving one missing-successor repair without another human prompt, alongside its remaining unattended-continuity limits.
+
 The blocking and bounded-follow-up mechanisms were validated across six harnesses on 2026-07-08 through 2026-08-13, with Claude's replacement Stop-owned path revalidated on 2026-07-24 and Cursor's stop-hook park validated on 2026-08-13.
 
 | Harness | Version verified | Mechanism | Observed result |
