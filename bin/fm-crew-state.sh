@@ -509,9 +509,14 @@ if [ "$HAVE_RUN" = 1 ]; then
         case "$CI_STEP_STATUS" in
           running)
             CI_LOG_STATE=$(nm_ci_checks_state)
+            pr_url=$(strip_quotes "$(nm_field pr)")
             if [ "$CI_LOG_STATE" = green ]; then
               RUN_STATE="done"
               RUN_DETAIL="checks green: PR ready for review (still monitoring for merge/close)"
+            elif [ -n "$pr_url" ] && [ "$pr_url" != "none" ] && [ "$pr_url" != '""' ]; then
+              # PR is open on remote. If no CI checks have reported or checks are waiting, treat PR as ready for captain review
+              RUN_STATE="done"
+              RUN_DETAIL="PR open ($pr_url): ready for review (ci monitoring)"
             fi
             ;;
           fixing)

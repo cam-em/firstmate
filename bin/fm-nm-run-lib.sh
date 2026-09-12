@@ -122,7 +122,10 @@ fm_nm_run_is_active() {  # <toon-output>
 # released the branch, and binding one by branch name alone is the historical
 # reused-branch misattribution the head rule exists to prevent.
 fm_nm_run_is_pipeline_owned_active() {  # <toon-output>
-  [ "$(fm_nm_branch_sync_state "$1")" = pipeline_owned ] || return 1
+  case "$(fm_nm_branch_sync_state "$1")" in
+    pipeline_owned|behind) ;;
+    *) return 1 ;;
+  esac
   fm_nm_run_is_active "$1"
 }
 
