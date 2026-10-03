@@ -177,6 +177,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-model-runtime-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-model-runtime-lib.sh"
 # fm-timing-lib.sh is inert unless FM_TIMING_LOG names a file, which only the
 # deferred network stage sets, so an ordinary bootstrap run records nothing.
 # shellcheck source=bin/fm-timing-lib.sh disable=SC1091
@@ -1093,7 +1095,7 @@ EOF
 }
 
 crew_dispatch_validate() {
-  local file err
+  local file err harness model
   file="$CONFIG/crew-dispatch.json"
   [ -f "$file" ] || return 0
   if ! command -v jq >/dev/null 2>&1; then
@@ -1169,6 +1171,23 @@ crew_dispatch_validate() {
     echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
     return 0
   fi
+  while IFS=$'\t' read -r harness model; do
+    [ -n "$harness" ] || continue
+    if fm_model_runtime_is_invalid "$harness" "$model"; then
+      echo "CREW_DISPATCH: invalid config/crew-dispatch.json - harness '$harness' cannot use Claude/Anthropic model '$model'; use harness 'claude' with the plain Claude Code model id"
+      return 0
+    fi
+  done < <(jq -r '
+    def profiles($value):
+      if ($value | type) == "array" then $value
+      elif ($value | type) == "object" then [$value]
+      else []
+      end;
+    ([(.rules // [])[]? | profiles(.use?)[]?]
+      + (if has("default") then [profiles(.default)[]?] else [] end))[]
+    | [.harness, (.model // "default")]
+    | @tsv
+  ' "$file")
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
     jq -r '
     def profile($p):

@@ -333,6 +333,8 @@ test_relaunch_preserves_durable_task_metadata() {
     printf '%s\n' 'pr_head=feature/relaunch'
     printf '%s\n' 'x_request=request-19'
     printf '%s\n' 'decisions_reviewed=1'
+    printf '%s\n' 'treehouse_lease_id=lease-rl19'
+    printf '%s\n' 'treehouse_lease_holder=rl19@test-home'
   } >> "$dir/home/state/rl19.meta"
 
   out=$(run_control "$dir" rl19 relaunch --note "continuing review work"); rc=$?
@@ -345,6 +347,10 @@ test_relaunch_preserves_durable_task_metadata() {
     || fail "the task X request must survive relaunch"
   [ "$(meta_field "$dir" rl19 decisions_reviewed)" = 1 ] \
     || fail "the task decision state must survive relaunch"
+  [ "$(meta_field "$dir" rl19 treehouse_lease_id)" = lease-rl19 ] \
+    || fail "the Treehouse lease id must survive relaunch"
+  [ "$(meta_field "$dir" rl19 treehouse_lease_holder)" = rl19@test-home ] \
+    || fail "the Treehouse lease holder must survive relaunch"
   pass "fm-control relaunch: durable task metadata survives replacement launch publication"
 }
 
@@ -592,6 +598,34 @@ test_explicit_model_wins_over_the_recorded_one() {
   [ "$(meta_field "$dir" rl7 model)" = sonnet ] || fail "an explicit model should be recorded"
   [ "$(meta_field "$dir" rl7 effort)" = low ] || fail "an explicit effort should be recorded"
   pass "fm-control relaunch: explicit model and effort win over the recorded ones"
+}
+
+test_relaunch_refuses_claude_models_on_non_claude_runtimes_before_stop() {
+  local harness model dir out rc n=0
+  while IFS='|' read -r harness model; do
+    n=$((n + 1))
+    dir=$(new_case "claude-route-$n" "rl-route-$n")
+    add_ship_task "$dir" "rl-route-$n" claude
+    out=$(run_control "$dir" "rl-route-$n" relaunch \
+      --harness "$harness" --model "$model" --note "keep Claude on Claude Code")
+    rc=$?
+    expect_code 1 "$rc" "relaunch onto $harness with $model should refuse"
+    assert_contains "$out" "harness '$harness'" "the relaunch refusal did not name the harness"
+    assert_contains "$out" "model '$model'" "the relaunch refusal did not name the model"
+    assert_contains "$out" "use --harness claude with the plain Claude Code model id" \
+      "the relaunch refusal did not name the correction"
+    [ "$(cat "$dir/fake/command")" = claude ] \
+      || fail "the runtime mismatch stopped the existing agent"
+    [ ! -s "$dir/fake/literal" ] \
+      || fail "the runtime mismatch delivered lifecycle input before refusing"
+    [ ! -e "$dir/home/state/rl-route-$n.control-relaunch" ] \
+      || fail "the runtime mismatch opened a relaunch transaction"
+  done <<'ROWS'
+pi|anthropic/vendor-alias
+opencode|CLAUDE-OPUS-5
+cursor|HAIKU
+ROWS
+  pass "fm-control relaunch refuses Claude models on pi, opencode, and cursor before stopping the worker"
 }
 
 test_relaunch_onto_an_unverified_harness_is_refused() {
@@ -1506,6 +1540,7 @@ test_harness_switch_resolves_a_prefixed_recorded_harness
 test_prefixed_recorded_harness_requires_explicit_replacement
 test_same_harness_relaunch_keeps_the_profile_axes
 test_explicit_model_wins_over_the_recorded_one
+test_relaunch_refuses_claude_models_on_non_claude_runtimes_before_stop
 test_relaunch_onto_an_unverified_harness_is_refused
 test_prior_harness_turnend_registry_entry_is_cleared
 test_wiring_removal_failure_refuses_before_replacement_arm

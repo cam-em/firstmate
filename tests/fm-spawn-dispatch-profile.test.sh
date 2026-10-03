@@ -401,6 +401,59 @@ test_claude_threads_model_and_effort() {
   pass "claude receives --model and --effort profile flags"
 }
 
+test_claude_models_require_claude_runtime_before_acquisition() {
+  local harness model rec id out status treehouse_log n=0
+  while IFS='|' read -r harness model; do
+    n=$((n + 1))
+    id="profile-claude-route-$n"
+    rec=$(make_spawn_case "profile-claude-route-$n" "$harness" "$id")
+    read_case_record "$rec"
+    treehouse_log="$CASE_DIR/treehouse.log"
+
+    out=$(FM_FAKE_TREEHOUSE_LOG="$treehouse_log" \
+      run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+        "$id" "$PROJ_DIR" --harness "$harness" --model "$model")
+    status=$?
+    expect_code 1 "$status" "$harness must refuse Claude/Anthropic model $model"
+    assert_contains "$out" "harness '$harness'" "the refusal did not name the resolved harness"
+    assert_contains "$out" "model '$model'" "the refusal did not name the resolved model"
+    assert_contains "$out" "use --harness claude with the plain Claude Code model id" \
+      "the refusal did not name the Claude Code correction"
+    assert_absent "$HOME_DIR/state/$id.meta" "the runtime mismatch wrote task metadata"
+    [ ! -s "$LAUNCH_LOG" ] || fail "the runtime mismatch launched $harness"
+    [ ! -s "$treehouse_log" ] || fail "the runtime mismatch acquired a Treehouse copy"
+  done <<'ROWS'
+pi|anthropic/vendor-alias
+opencode|CLAUDE-OPUS-5
+cursor|FABLE
+ROWS
+  pass "Claude/Anthropic models are refused on pi, opencode, and cursor before copy acquisition"
+}
+
+test_spawn_leases_and_records_the_exact_treehouse_copy() {
+  local rec id out status treehouse_log holder
+  id=profile-treehouse-lease-z2b
+  rec=$(make_spawn_case profile-treehouse-lease codex "$id")
+  read_case_record "$rec"
+  treehouse_log="$CASE_DIR/treehouse.log"
+  holder="$id@$HOME_DIR"
+
+  out=$(FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_TREEHOUSE_LEASE_ID=lease-z2b \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR" --model gpt-5)
+  status=$?
+  expect_code 0 "$status" "spawn should lease its Treehouse copy"
+  assert_grep "get --lease --json --lease-holder $holder" "$treehouse_log" \
+    "spawn did not request a durable task/home lease"
+  assert_grep 'treehouse_lease_id=lease-z2b' "$HOME_DIR/state/$id.meta" \
+    "spawn did not record the lease identity"
+  assert_grep "treehouse_lease_holder=$holder" "$HOME_DIR/state/$id.meta" \
+    "spawn did not record the lease holder"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
+    "spawn did not bind metadata to the leased path"
+  pass "spawn durably leases and records the exact Treehouse copy"
+}
+
 test_codex_threads_model_and_effort() {
   local rec id out status launch
   id=profile-codex-z3
@@ -558,23 +611,23 @@ test_cursor_failed_catalog_probe_does_not_block_spawn() {
   pass "cursor preserves the requested model when its live catalog is unreachable"
 }
 
-test_opencode_threads_model_and_ignores_effort_axis() {
+test_opencode_threads_non_claude_model_and_ignores_effort_axis() {
   local rec id out status launch
   id=profile-opencode-z7
   rec=$(make_spawn_case profile-opencode opencode "$id")
   read_case_record "$rec"
 
-  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model anthropic/claude-sonnet-4-5 --effort high)
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model openai/gpt-4.1 --effort high)
   status=$?
   expect_code 0 "$status" "opencode spawn with model and ignored effort should succeed"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" opencode anthropic/claude-sonnet-4-5 high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" opencode openai/gpt-4.1 high
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "opencode --model 'anthropic/claude-sonnet-4-5' --prompt" \
+  assert_contains "$launch" "opencode --model 'openai/gpt-4.1' --prompt" \
     "opencode launch did not thread model"
   assert_not_contains "$launch" "--effort" "opencode launch must not pass unsupported --effort"
   assert_not_contains "$launch" "--variant" "opencode launch must not pass run-only --variant"
   assert_not_contains "$launch" "--thinking" "opencode launch must not pass pi thinking flag"
-  pass "opencode receives --model and omits the unsupported effort axis"
+  pass "opencode receives a non-Claude --model and omits the unsupported effort axis"
 }
 
 test_pi_threads_model_and_max_effort() {
@@ -807,6 +860,8 @@ test_active_dispatch_profile_allows_explicit_harness
 test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
+test_claude_models_require_claude_runtime_before_acquisition
+test_spawn_leases_and_records_the_exact_treehouse_copy
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
 test_grok_threads_model_and_reasoning_effort
@@ -815,7 +870,7 @@ test_grok_omits_invalid_xhigh_reasoning_effort
 test_cursor_threads_model_workspace_and_omits_effort_axis
 test_cursor_refuses_model_absent_from_live_catalog
 test_cursor_failed_catalog_probe_does_not_block_spawn
-test_opencode_threads_model_and_ignores_effort_axis
+test_opencode_threads_non_claude_model_and_ignores_effort_axis
 test_pi_threads_model_and_max_effort
 test_pi_tui_mode_probe_is_safe_for_old_and_new_pi
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity

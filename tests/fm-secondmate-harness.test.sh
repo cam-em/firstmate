@@ -660,6 +660,16 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = get ] && [ "${2:-}" = --lease ]; then
+  printf '{"path":"%s","lease_id":"lease-secondmate-suite","lease_holder":"%s"}\n' \
+    "${FM_FAKE_PANE_PATH:?}" "${@: -1}"
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/treehouse"
   fm_fake_exit0 "$fakebin" pi
   printf '%s\n' "$fakebin"
 }

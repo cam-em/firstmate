@@ -251,14 +251,39 @@ EOF
 }
 
 # fm_test_make_spawn_fakebin <dir> [extra-exit0-tool...]
-# Creates <dir>/fakebin with the spawn tmux stub, a no-op treehouse, and any
-# extra exit-0 tools. Echoes the fakebin path.
+# Creates <dir>/fakebin with the spawn tmux stub, a durable-lease treehouse
+# fake, and any extra exit-0 tools. The fake returns FM_FAKE_PANE_PATH as the
+# leased copy, records argv when FM_FAKE_TREEHOUSE_LOG is set, and never runs a
+# real Treehouse operation. Echoes the fakebin path.
 fm_test_make_spawn_fakebin() {
   local dir=$1 fakebin
   shift
   fakebin=$(fm_fakebin "$dir")
   fm_test_fake_tmux_spawn "$fakebin"
-  fm_fake_exit0 "$fakebin" treehouse "$@"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ -z "${FM_FAKE_TREEHOUSE_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
+case "${1:-}" in
+  get)
+    holder=
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --lease-holder) holder=${2:-}; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '{"path":"%s","lease_id":"%s","lease_holder":"%s","leased_at":"2026-10-03T00:00:00Z"}\n' \
+      "${FM_FAKE_PANE_PATH:?}" "${FM_FAKE_TREEHOUSE_LEASE_ID:-lease-test-id}" "$holder"
+    ;;
+  return) ;;
+  --help|-h) printf '%s\n' 'Usage: treehouse get [--lease] [--json]' ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" "$@"
   printf '%s\n' "$fakebin"
 }
 

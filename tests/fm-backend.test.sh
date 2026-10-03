@@ -807,7 +807,16 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+holder=
+shift
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in --lease-holder) holder=\${2:-}; shift 2 ;; *) shift ;; esac
+done
+printf '{"path":"%s","lease_id":"backend-spawn-lease","lease_holder":"%s"}\n' '$wt' "\$holder"
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -877,7 +886,16 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+holder=
+shift
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in --lease-holder) holder=\${2:-}; shift 2 ;; *) shift ;; esac
+done
+printf '{"path":"%s","lease_id":"backend-symlink-lease","lease_holder":"%s"}\n' '$wt' "\$holder"
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -990,9 +1008,11 @@ test_teardown_conformance_old_vs_new() {
 
   fm_write_meta "$state_old/$id.meta" \
     "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
+    "treehouse_lease_id=backend-test-lease" "treehouse_lease_holder=$id@test-home" \
     "decisions_reviewed=1" "decision_keys="
   fm_write_meta "$state_new/$id.meta" \
     "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
+    "treehouse_lease_id=backend-test-lease" "treehouse_lease_holder=$id@test-home" \
     "decisions_reviewed=1" "decision_keys="
   touch "$state_old/.last-watcher-beat" "$state_new/.last-watcher-beat"
 
@@ -1004,8 +1024,8 @@ test_teardown_conformance_old_vs_new() {
 
   expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
   expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
-  assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
-    "teardown did not call treehouse return --force <worktree>"
+  assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f''--if-lease-id'$'\x1f''backend-test-lease'$'\x1f''--if-lease-holder'$'\x1f'"$id@test-home"$'\x1f'"$wt" \
+    "teardown did not guard treehouse return with the recorded lease identity"
   # The legacy fixture's adapter comes from BASE_REF, so its selector form is
   # whatever the merge-base carried: permissive while the exact-selector change
   # was still on a branch, exact for every branch cut after it landed on main.

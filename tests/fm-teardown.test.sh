@@ -194,6 +194,8 @@ write_meta() {
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode" \
+    "treehouse_lease_id=lease-task-x1" \
+    "treehouse_lease_holder=task-x1@test-home" \
     "spawn_gen=teardown-test-task-x1"
 }
 
@@ -610,6 +612,77 @@ test_local_only_fork_remote_allows() {
   ' "$case_dir/state/home-summary.json" >/dev/null \
     || fail "successful task teardown did not publish the task's removal from the home summary ledger"
   pass "local-only worktree with HEAD on a fork remote is torn down and the home summary is refreshed"
+}
+
+test_teardown_returns_only_the_recorded_treehouse_lease() {
+  local case_dir log out rc
+  case_dir=$(make_case lease-return)
+  write_meta "$case_dir" local-only ship
+  log="$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  out=$(run_teardown "$case_dir" --force 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "leased worktree teardown should succeed"
+  assert_grep "return --force --if-lease-id lease-task-x1 --if-lease-holder task-x1@test-home $case_dir/wt" "$log" \
+    "teardown did not guard Treehouse return with both recorded lease identities"
+  assert_contains "$out" "teardown task-x1 complete" "leased teardown did not report completion"
+  pass "successful teardown returns only the exact recorded Treehouse lease"
+}
+
+test_teardown_refusal_keeps_the_treehouse_lease() {
+  local case_dir log out rc
+  case_dir=$(make_case lease-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'unlanded' > "$case_dir/wt/unlanded.txt"
+  log="$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  out=$(run_teardown "$case_dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "dirty worktree teardown unexpectedly succeeded"
+  assert_contains "$out" "uncommitted changes" "dirty teardown did not explain its refusal"
+  [ ! -s "$log" ] || fail "a refused teardown released the Treehouse lease"
+  assert_present "$case_dir/state/task-x1.meta" "a refused teardown removed task metadata"
+  pass "teardown refusals preserve the durable Treehouse lease"
+}
+
+test_legacy_unleased_teardown_never_returns_or_mutates_the_copy() {
+  local case_dir log out rc branch meta_tmp
+  case_dir=$(make_case legacy-unleased)
+  write_meta "$case_dir" local-only ship
+  meta_tmp="$case_dir/state/task-x1.meta.tmp"
+  sed '/^treehouse_lease_/d' "$case_dir/state/task-x1.meta" > "$meta_tmp"
+  mv "$meta_tmp" "$case_dir/state/task-x1.meta"
+  branch=$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)
+  log="$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  out=$(run_teardown "$case_dir" --force 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "legacy unleased teardown should retire safely"
+  [ ! -s "$log" ] || fail "legacy teardown returned a copy with no ownership identity"
+  [ "$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)" = "$branch" ] \
+    || fail "legacy teardown mutated the recorded worktree branch"
+  assert_contains "$out" "predates durable Treehouse lease metadata" \
+    "legacy teardown did not explain why it left the copy untouched"
+  assert_absent "$case_dir/state/task-x1.meta" "legacy teardown left its retired task record"
+  pass "legacy unleased metadata tears down without releasing or mutating a possibly reassigned copy"
 }
 
 test_teardown_closes_the_backlog_item_itself() {
@@ -1855,7 +1928,9 @@ configure_secondmate_with_tmux_children() {  # <case-dir>
       "worktree=$child_wt" \
       "project=$case_dir/project" \
       "kind=ship" \
-      "mode=local-only"
+      "mode=local-only" \
+      "treehouse_lease_id=lease-$child" \
+      "treehouse_lease_holder=$child@secondmate-home"
     : > "$home/state/$child.status"
   done
 }
@@ -1931,6 +2006,11 @@ SH
     || fail "descendant-locks: uncontended retry retained retired task state"
   [ -s "$case_dir/kill.log" ] && [ -s "$case_dir/treehouse.log" ] \
     || fail "descendant-locks: uncontended retry did not perform endpoint and worktree cleanup"
+  for child in child-a child-b; do
+    assert_grep "return --force --if-lease-id lease-$child --if-lease-holder $child@secondmate-home $case_dir/$child-wt" \
+      "$case_dir/treehouse.log" \
+      "descendant-locks: cleanup did not guard $child's return with its lease identity"
+  done
   pass "forced secondmate teardown holds every descendant lifecycle and metadata lock"
 }
 
@@ -3200,6 +3280,9 @@ EOF
 }
 
 test_local_only_fork_remote_allows
+test_teardown_returns_only_the_recorded_treehouse_lease
+test_teardown_refusal_keeps_the_treehouse_lease
+test_legacy_unleased_teardown_never_returns_or_mutates_the_copy
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses

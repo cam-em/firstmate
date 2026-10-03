@@ -45,6 +45,10 @@
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed.
+#   A Claude/Anthropic model always requires the claude harness. The shared
+#   classifier in bin/fm-model-runtime-lib.sh covers anthropic/ provider ids and
+#   the Claude Code aliases, and this script refuses a mismatch before creating
+#   or reusing an endpoint.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -155,6 +159,13 @@
 #   containment test reads local refs only and never fetches, so this gate stays
 #   usable offline; a stale remote-tracking ref can therefore make an unpushed
 #   commit look contained, which is exactly why no remedy command is printed.
+#   Every fresh non-Orca ship/scout acquisition uses `treehouse get --lease
+#   --json --lease-holder <task-id>@<home>`. The returned lease id and holder are
+#   recorded in task meta, the pane explicitly cd's into that exact path, and a
+#   relaunch reuses the same recorded worktree and lease without acquiring a new
+#   slot. Legacy records without these fields remain readable and are never
+#   upgraded by resetting or reacquiring their copy; teardown owns their safe
+#   no-return migration behavior.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -323,6 +334,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-model-runtime-lib.sh
+. "$SCRIPT_DIR/fm-model-runtime-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -521,6 +534,12 @@ spawn_remote_secondmate() {
       effort=$("$SCRIPT_DIR/fm-harness.sh" secondmate-effort)
       [ -n "$effort" ] || effort=-
     fi
+  fi
+  if fm_model_runtime_is_invalid "$harness" "$model"; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: refusing harness '$harness' with Claude/Anthropic model '$model'; use --harness claude with the plain Claude Code model id" >&2
+    return 1
   fi
   # A remote second mate always runs on Herdr: its server belongs to the host's
   # own GUI login session, so the endpoint outlives every SSH connection that
@@ -762,6 +781,8 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+TREEHOUSE_LEASE_ID=
+TREEHOUSE_LEASE_HOLDER=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1448,6 +1469,33 @@ if [ "$KIND" = secondmate ] && { [ "$HARNESS" = muse ] || [ "$HARNESS" = gemini 
   exit 1
 fi
 
+# config/secondmate-harness may carry optional model/effort tokens alongside the
+# harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
+# --secondmate spawn and no explicit per-spawn harness/raw launch was supplied, so
+# the harness itself came from the secondmate config fallback chain. Resolving
+# here on every spawn makes the pin durable across respawns. Precedence: explicit
+# --model/--effort flags still win over the file's tokens.
+if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
+  if [ "$MODEL_SET" -eq 0 ]; then
+    SM_MODEL=$("$SCRIPT_DIR/fm-harness.sh" secondmate-model)
+    [ -z "$SM_MODEL" ] || MODEL=$SM_MODEL
+  fi
+  if [ "$EFFORT_SET" -eq 0 ]; then
+    SM_EFFORT=$("$SCRIPT_DIR/fm-harness.sh" secondmate-effort)
+    if [ -n "$SM_EFFORT" ]; then
+      case "$SM_EFFORT" in
+        low|medium|high|xhigh|max) EFFORT=$SM_EFFORT ;;
+        *) echo "warning: config/secondmate-harness effort token '$SM_EFFORT' is not one of low, medium, high, xhigh, max; ignoring" >&2 ;;
+      esac
+    fi
+  fi
+fi
+
+if fm_model_runtime_is_invalid "$HARNESS" "$MODEL"; then
+  echo "error: refusing harness '$HARNESS' with Claude/Anthropic model '$MODEL'; use --harness claude with the plain Claude Code model id" >&2
+  exit 1
+fi
+
 case "$HARNESS" in
   pi|pi-signed)
     PI_BIN=$(resolve_pi_executable "$HARNESS") || {
@@ -1478,28 +1526,6 @@ case "$HARNESS" in
     fi
     ;;
 esac
-
-# config/secondmate-harness may carry optional model/effort tokens alongside the
-# harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
-# --secondmate spawn and no explicit per-spawn harness/raw launch was supplied, so
-# the harness itself came from the secondmate config fallback chain. Resolving
-# here on every spawn makes the pin durable across respawns. Precedence: explicit
-# --model/--effort flags still win over the file's tokens.
-if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
-  if [ "$MODEL_SET" -eq 0 ]; then
-    SM_MODEL=$("$SCRIPT_DIR/fm-harness.sh" secondmate-model)
-    [ -z "$SM_MODEL" ] || MODEL=$SM_MODEL
-  fi
-  if [ "$EFFORT_SET" -eq 0 ]; then
-    SM_EFFORT=$("$SCRIPT_DIR/fm-harness.sh" secondmate-effort)
-    if [ -n "$SM_EFFORT" ]; then
-      case "$SM_EFFORT" in
-        low|medium|high|xhigh|max) EFFORT=$SM_EFFORT ;;
-        *) echo "warning: config/secondmate-harness effort token '$SM_EFFORT' is not one of low, medium, high, xhigh, max; ignoring" >&2 ;;
-      esac
-    fi
-  fi
-fi
 
 secondmate_registry_value() {
   secondmate_registry_field "$DATA/secondmates.md" "$1" "$2"
@@ -2638,9 +2664,39 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  TREEHOUSE_LEASE_HOLDER="$ID@$FM_HOME"
+  if ! TREEHOUSE_LEASE_JSON=$(cd "$PROJ_ABS" \
+      && treehouse get --lease --json --lease-holder "$TREEHOUSE_LEASE_HOLDER"); then
+    echo "error: treehouse could not lease a worktree for task $ID" >&2
+    exit 1
+  fi
+  if ! TREEHOUSE_LEASE_RECORD=$(printf '%s\n' "$TREEHOUSE_LEASE_JSON" | jq -er '
+      select((.path | type) == "string" and (.path | length) > 0)
+      | select((.lease_id | type) == "string" and (.lease_id | length) > 0)
+      | select((.lease_holder | type) == "string" and (.lease_holder | length) > 0)
+      | [.path, .lease_id, .lease_holder]
+      | @tsv
+    '); then
+    echo "error: treehouse leased a worktree for task $ID but returned malformed lease metadata; the lease holder is '$TREEHOUSE_LEASE_HOLDER' and must be reconciled before retrying" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r WT TREEHOUSE_LEASE_ID TREEHOUSE_REPORTED_HOLDER <<EOF
+$TREEHOUSE_LEASE_RECORD
+EOF
+  if [ "$TREEHOUSE_REPORTED_HOLDER" != "$TREEHOUSE_LEASE_HOLDER" ]; then
+    echo "error: treehouse returned lease holder '$TREEHOUSE_REPORTED_HOLDER' for task $ID, expected '$TREEHOUSE_LEASE_HOLDER'; refusing to enter an ambiguously owned copy" >&2
+    exit 1
+  fi
+  case "$WT" in
+    /*) ;;
+    *)
+      echo "error: treehouse returned non-absolute leased worktree path '$WT' for task $ID" >&2
+      exit 1
+      ;;
+  esac
+  spawn_send_text_line "$WT_TARGET" "cd -- $(shell_quote "$WT")"
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the pane shell to cd into the exact durably leased worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -2653,38 +2709,34 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # settled there: on some tmux/WSL setups a brand-new window's pane_current_path
   # transiently reports an unrelated stale path (seen live as another real git
   # checkout entirely) before the shell catches up with treehouse get's cd. That
-  # stale path still passes the PROJ_ABS_REAL comparison and validate_spawn_worktree
-  # below (it resolves to a real, distinct worktree top-level too), so accepting it
-  # on one read alone silently records the wrong worktree= in state/<id>.meta. Require
-  # two consecutive reads to agree on the same non-project path before accepting it;
-  # a mismatch just becomes the new candidate rather than resetting the wait, so a
-  # pane that is already settled by the first real read only costs the one existing
-  # inter-poll sleep as confirmation, not a whole extra cycle on top.
-  candidate=""
+  # stale path can itself be a valid worktree. Require two consecutive reads of
+  # the exact leased path before continuing; no unrelated checkout can become the
+  # task's recorded worktree merely because the terminal reported it twice.
+  leased_wt_real=$(real_path_or_raw "$WT")
+  settled_reads=0
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
       p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-        if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-          WT="$p"
+      if [ "$p_real" = "$leased_wt_real" ]; then
+        settled_reads=$((settled_reads + 1))
+        if [ "$settled_reads" -ge 2 ]; then
           break
         fi
-        candidate="$p_real"
       else
-        candidate=""
+        settled_reads=0
       fi
     else
-      candidate=""
+      settled_reads=0
     fi
     sleep 1
   done
-  if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+  if [ "$settled_reads" -lt 2 ]; then
+    echo "error: pane did not enter treehouse's leased worktree '$WT' within 60s; lease id '$TREEHOUSE_LEASE_ID' remains held for task $ID, inspect window $T" >&2
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "treehouse lease" "$T"
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
@@ -3159,6 +3211,10 @@ preserve_relaunch_meta() {
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
+  if [ -n "$TREEHOUSE_LEASE_ID" ]; then
+    echo "treehouse_lease_id=$TREEHOUSE_LEASE_ID"
+    echo "treehouse_lease_holder=$TREEHOUSE_LEASE_HOLDER"
+  fi
   echo "harness=$HARNESS"
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"

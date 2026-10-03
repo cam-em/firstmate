@@ -136,6 +136,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-model-runtime-lib.sh
+. "$SCRIPT_DIR/fm-model-runtime-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -681,6 +683,9 @@ resolve_relaunch_profile() {
     TARGET_EFFORT=$PRIOR_EFFORT
   else
     TARGET_EFFORT=default
+  fi
+  if fm_model_runtime_is_invalid "$TARGET_HARNESS" "$TARGET_MODEL"; then
+    die "refusing harness '$TARGET_HARNESS' with Claude/Anthropic model '$TARGET_MODEL'; use --harness claude with the plain Claude Code model id"
   fi
 }
 

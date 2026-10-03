@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the fm-spawn.sh treehouse-get worktree-detection settle
-# loop (bin/fm-spawn.sh, the `for _ in $(seq 1 60)` loop after `treehouse get`).
+# Regression test for fm-spawn.sh's leased-worktree pane-settle loop.
 #
 # On some tmux/WSL setups a brand-new window's pane_current_path transiently
 # reports a stale, unrelated-but-real path on the very first poll, before the
@@ -54,7 +53,21 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+holder=
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lease-holder) holder=${2:-}; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"path":"%s","lease_id":"settle-lease-id","lease_holder":"%s"}\n' \
+  "${FM_FAKE_PANE_PATH:?}" "$holder"
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
