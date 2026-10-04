@@ -52,7 +52,17 @@
 # for the common case where there is no remote at all.
 # Fresh ordinary task records carry the exact durable Treehouse lease id and
 # holder published by fm-spawn. Teardown passes both identities to `treehouse
-# return`, so a stale or mismatched record cannot release another task's copy.
+# return` only after every refusal-capable cleanup step and durable task-record
+# transition has succeeded, so a stale or mismatched record cannot release
+# another task's copy and a refusal never makes that copy reusable.
+# Before retiring the ordinary record, teardown atomically publishes
+# state/<id>.treehouse-lease in phase=cleanup. The journal survives a failed
+# final return and lets a later teardown reconcile the exact lease after the
+# ordinary record is gone. Spawn-side intent and observed journals are also
+# recoverable by holder through `treehouse status --json`; acquired or published
+# journals require --force because a worker may already have started. Existing
+# records without lease identity retain the migration behavior below and never
+# cause teardown to return a possibly reassigned copy.
 # Legacy records with neither field are migration-safe: after all ordinary work
 # safety gates pass, teardown retires the endpoint and task record but leaves the
 # recorded worktree, its processes, branch, hooks, and pool state untouched.
@@ -217,6 +227,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-treehouse-lease-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lease-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -296,17 +308,139 @@ fm_refuse_if_gate_agent
 FM_LOCK_LOG_PREFIX=teardown
 
 META="$STATE/$ID.meta"
-fm_backlog_record_present "$META" "task record" "$STATE" || {
-  echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
-  exit 1
-}
+TREEHOUSE_LEASE_JOURNAL=$(fm_treehouse_lease_journal_path "$STATE" "$ID")
+TREEHOUSE_JOURNAL_ONLY=0
+if ! fm_backlog_record_present "$META" "task record" "$STATE"; then
+  if [ ! -e "$META" ] && [ ! -L "$META" ] \
+     && [ -f "$TREEHOUSE_LEASE_JOURNAL" ] && [ ! -L "$TREEHOUSE_LEASE_JOURNAL" ]; then
+    TREEHOUSE_JOURNAL_ONLY=1
+  else
+    echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
+    exit 1
+  fi
+fi
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
 fm_lock_acquire_wait "$META_LOCK"
 META_LOCK_HELD=1
-fm_backlog_record_present "$META" "task record" "$STATE" || {
-  echo "error: teardown refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
-  exit 1
+if ! fm_backlog_record_present "$META" "task record" "$STATE"; then
+  if [ ! -e "$META" ] && [ ! -L "$META" ] \
+     && [ -f "$TREEHOUSE_LEASE_JOURNAL" ] && [ ! -L "$TREEHOUSE_LEASE_JOURNAL" ]; then
+    TREEHOUSE_JOURNAL_ONLY=1
+  else
+    echo "error: teardown refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
+    exit 1
+  fi
+else
+  TREEHOUSE_JOURNAL_ONLY=0
+fi
+
+recover_treehouse_lease_journal() {  # <journal> <task-id> <expected-home> <force>
+  local journal=$1 task_id=$2 expected_home=$3 force=${4:-}
+  local status_json match_record match_count current_path current_id current_holder lookup_id
+  fm_treehouse_lease_journal_load "$journal" "$task_id" || {
+    echo "error: Treehouse lease recovery journal is malformed: $journal" >&2
+    return 1
+  }
+  [ "$FM_TREEHOUSE_LEASE_HOME" = "$expected_home" ] || {
+    echo "error: Treehouse lease recovery journal for $task_id belongs to home $FM_TREEHOUSE_LEASE_HOME, not $expected_home" >&2
+    return 1
+  }
+  case "$FM_TREEHOUSE_LEASE_PHASE" in
+    acquired|published)
+      [ "$force" = --force ] || {
+        echo "REFUSED: Treehouse lease recovery for $task_id may have a launched worker; rerun with --force only when discarding that work is authorized" >&2
+        return 1
+      }
+      ;;
+  esac
+  [ -d "$FM_TREEHOUSE_LEASE_PROJECT" ] || {
+    echo "error: Treehouse lease recovery project is unavailable: $FM_TREEHOUSE_LEASE_PROJECT" >&2
+    return 1
+  }
+  command -v treehouse >/dev/null 2>&1 || {
+    echo "error: treehouse command not found; cannot reconcile lease journal $journal" >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "error: jq command not found; cannot reconcile lease journal $journal" >&2
+    return 1
+  }
+  status_json=$(cd "$FM_TREEHOUSE_LEASE_PROJECT" && treehouse status --json) || {
+    echo "error: treehouse status failed while reconciling lease journal $journal" >&2
+    return 1
+  }
+  lookup_id=
+  case "$FM_TREEHOUSE_LEASE_PHASE" in
+    acquired|published|cleanup) lookup_id=$FM_TREEHOUSE_LEASE_ID ;;
+  esac
+  match_record=$(printf '%s\n' "$status_json" | jq -er \
+    --arg lease_id "$lookup_id" \
+    --arg holder "$FM_TREEHOUSE_LEASE_REQUESTED_HOLDER" '
+      [ .[]
+        | select(.status == "leased")
+        | select(if $lease_id != "" then .lease_id == $lease_id else .lease_holder == $holder end)
+      ] as $matches
+      | ($matches | length) as $count
+      | if $count == 0 then "0"
+        elif $count == 1 then
+          ["1", ($matches[0].path // ""), ($matches[0].lease_id // ""), ($matches[0].lease_holder // "")] | @tsv
+        else ($count | tostring)
+        end
+    ') || {
+    echo "error: treehouse status returned malformed lease data while reconciling $journal" >&2
+    return 1
+  }
+  match_count=${match_record%%$'\t'*}
+  if [ "$match_count" = 0 ]; then
+    fm_treehouse_lease_journal_remove "$journal" || return 1
+    echo "teardown $task_id complete (no active Treehouse lease remained)"
+    return 0
+  fi
+  [ "$match_count" = 1 ] || {
+    echo "error: Treehouse lease recovery found $match_count active leases for $task_id; refusing an ambiguous return" >&2
+    return 1
+  }
+  IFS=$'\t' read -r _ current_path current_id current_holder <<EOF
+$match_record
+EOF
+  case "$current_path" in /*) ;; *) echo "error: Treehouse lease recovery returned a non-absolute path for $task_id" >&2; return 1 ;; esac
+  [ -n "$current_id" ] && [ "$current_holder" = "$FM_TREEHOUSE_LEASE_REQUESTED_HOLDER" ] || {
+    echo "error: Treehouse lease recovery returned incomplete or mismatched identity for $task_id" >&2
+    return 1
+  }
+  case "$FM_TREEHOUSE_LEASE_PHASE" in
+    acquired|published|cleanup)
+      [ -n "$FM_TREEHOUSE_LEASE_ID" ] \
+        && [ "$current_id" = "$FM_TREEHOUSE_LEASE_ID" ] || {
+        echo "error: Treehouse lease id changed while recovering $task_id; refusing return" >&2
+        return 1
+      }
+      [ "$current_holder" = "$FM_TREEHOUSE_LEASE_HOLDER" ] || {
+        echo "error: Treehouse lease holder changed while recovering $task_id; refusing return" >&2
+        return 1
+      }
+      [ "$current_path" = "$FM_TREEHOUSE_LEASE_WORKTREE" ] || {
+        echo "error: Treehouse worktree path changed while recovering $task_id; refusing return" >&2
+        return 1
+      }
+      ;;
+  esac
+  ( cd "$FM_TREEHOUSE_LEASE_PROJECT" \
+      && treehouse return --force --if-lease-id "$current_id" \
+        --if-lease-holder "$current_holder" "$current_path" ) || {
+    echo "error: treehouse return failed while recovering lease journal $journal" >&2
+    return 1
+  }
+  fm_treehouse_lease_journal_remove "$journal" || {
+    echo "warning: Treehouse lease returned, but redundant recovery journal remains at $journal" >&2
+  }
+  echo "teardown $task_id complete (recovered Treehouse lease $current_id)"
 }
+
+if [ "$TREEHOUSE_JOURNAL_ONLY" = 1 ]; then
+  recover_treehouse_lease_journal "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" "$FORCE"
+  exit $?
+fi
 TEARDOWN_META_KIND=$(fm_meta_get "$META" kind)
 [ -n "$TEARDOWN_META_KIND" ] || TEARDOWN_META_KIND=ship
 TEARDOWN_CLEANUP_RECOVERY=$(fm_meta_get "$META" cleanup_recovery)
@@ -795,11 +929,28 @@ MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 TREEHOUSE_LEASE_ID=$(fm_meta_get "$META" treehouse_lease_id)
 TREEHOUSE_LEASE_HOLDER=$(fm_meta_get "$META" treehouse_lease_holder)
 TREEHOUSE_LEASED=0
+TREEHOUSE_POST_CLEANUP_CHECK=
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   if [ -n "$TREEHOUSE_LEASE_ID" ] && [ -n "$TREEHOUSE_LEASE_HOLDER" ]; then
     TREEHOUSE_LEASED=1
   elif [ -n "$TREEHOUSE_LEASE_ID" ] || [ -n "$TREEHOUSE_LEASE_HOLDER" ]; then
     echo "error: task $ID records only part of its Treehouse lease identity; refusing cleanup without both treehouse_lease_id and treehouse_lease_holder" >&2
+    exit 1
+  fi
+fi
+if [ "$TREEHOUSE_LEASED" = 1 ] \
+   && { [ -e "$TREEHOUSE_LEASE_JOURNAL" ] || [ -L "$TREEHOUSE_LEASE_JOURNAL" ]; }; then
+  fm_treehouse_lease_journal_load "$TREEHOUSE_LEASE_JOURNAL" "$ID" || {
+    echo "error: task $ID has a malformed Treehouse lease recovery journal; refusing cleanup" >&2
+    exit 1
+  }
+  if ! { [ "$FM_TREEHOUSE_LEASE_HOME" = "$FM_HOME" ] \
+      && [ "$FM_TREEHOUSE_LEASE_PROJECT" = "$PROJ" ] \
+      && [ "$FM_TREEHOUSE_LEASE_REQUESTED_HOLDER" = "$TREEHOUSE_LEASE_HOLDER" ] \
+      && { [ -z "$FM_TREEHOUSE_LEASE_ID" ] || [ "$FM_TREEHOUSE_LEASE_ID" = "$TREEHOUSE_LEASE_ID" ]; } \
+      && { [ -z "$FM_TREEHOUSE_LEASE_HOLDER" ] || [ "$FM_TREEHOUSE_LEASE_HOLDER" = "$TREEHOUSE_LEASE_HOLDER" ]; } \
+      && { [ -z "$FM_TREEHOUSE_LEASE_WORKTREE" ] || [ "$FM_TREEHOUSE_LEASE_WORKTREE" = "$WT" ]; }; }; then
+    echo "error: task $ID's Treehouse lease recovery journal does not match its durable task record; refusing cleanup" >&2
     exit 1
   fi
 fi
@@ -2376,8 +2527,42 @@ preflight_descendant_task_locks() {
 
 validate_firstmate_home_children_removal() {
   local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
+  local child_journal child_lease_id child_lease_holder
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
+  for child_journal in "$sub_state"/*.treehouse-lease; do
+    [ -e "$child_journal" ] || [ -L "$child_journal" ] || continue
+    child_id=$(basename "$child_journal" .treehouse-lease)
+    fm_treehouse_lease_journal_load "$child_journal" "$child_id" || {
+      echo "REFUSED: child Treehouse lease recovery journal is malformed: $child_journal" >&2
+      return 1
+    }
+    [ "$FM_TREEHOUSE_LEASE_HOME" = "$home" ] || {
+      echo "REFUSED: child Treehouse lease recovery journal for $child_id belongs to another home" >&2
+      return 1
+    }
+    if ! { [ -d "$FM_TREEHOUSE_LEASE_PROJECT" ] \
+        && command -v treehouse >/dev/null 2>&1 \
+        && command -v jq >/dev/null 2>&1; }; then
+      echo "REFUSED: child Treehouse lease recovery prerequisites are unavailable for $child_id" >&2
+      return 1
+    fi
+    child_meta="$sub_state/$child_id.meta"
+    if [ -f "$child_meta" ] && [ ! -L "$child_meta" ]; then
+      child_wt=$(meta_value "$child_meta" worktree)
+      child_proj=$(meta_value "$child_meta" project)
+      child_lease_id=$(meta_value "$child_meta" treehouse_lease_id)
+      child_lease_holder=$(meta_value "$child_meta" treehouse_lease_holder)
+      if ! { [ "$FM_TREEHOUSE_LEASE_PROJECT" = "$child_proj" ] \
+          && [ "$FM_TREEHOUSE_LEASE_REQUESTED_HOLDER" = "$child_lease_holder" ] \
+          && { [ -z "$FM_TREEHOUSE_LEASE_ID" ] || [ "$FM_TREEHOUSE_LEASE_ID" = "$child_lease_id" ]; } \
+          && { [ -z "$FM_TREEHOUSE_LEASE_HOLDER" ] || [ "$FM_TREEHOUSE_LEASE_HOLDER" = "$child_lease_holder" ]; } \
+          && { [ -z "$FM_TREEHOUSE_LEASE_WORKTREE" ] || [ "$FM_TREEHOUSE_LEASE_WORKTREE" = "$child_wt" ]; }; }; then
+        echo "REFUSED: child Treehouse lease recovery journal for $child_id does not match its task record" >&2
+        return 1
+      fi
+    fi
+  done
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
@@ -2557,9 +2742,16 @@ preflight_firstmate_home_herdr_children() {  # <home>
 
 cleanup_firstmate_home_children() {
   local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_busy_gen
-  local child_lease_id child_lease_holder
+  local child_lease_id child_lease_holder child_journal child_lease_pending
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
+  for child_journal in "$sub_state"/*.treehouse-lease; do
+    [ -e "$child_journal" ] || [ -L "$child_journal" ] || continue
+    child_id=$(basename "$child_journal" .treehouse-lease)
+    [ -e "$sub_state/$child_id.meta" ] || [ -L "$sub_state/$child_id.meta" ] \
+      || recover_treehouse_lease_journal "$child_journal" "$child_id" "$home" --force \
+      || return $?
+  done
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
@@ -2570,6 +2762,8 @@ cleanup_firstmate_home_children() {
     child_backend=$(fm_backend_of_meta "$child_meta")
     child_lease_id=$(meta_value "$child_meta" treehouse_lease_id)
     child_lease_holder=$(meta_value "$child_meta" treehouse_lease_holder)
+    child_journal=$(fm_treehouse_lease_journal_path "$sub_state" "$child_id")
+    child_lease_pending=0
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
     else
@@ -2615,7 +2809,7 @@ cleanup_firstmate_home_children() {
           "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       fi
       fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" || return 1
-    elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
+    elif [ -n "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       if [ -n "$child_lease_id" ] && [ -n "$child_lease_holder" ]; then
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" \
@@ -2625,8 +2819,7 @@ cleanup_firstmate_home_children() {
           echo "error: cannot return leased child worktree $child_wt for $child_id; preserving its durable task record" >&2
           return 1
         fi
-        teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" "" \
-          "$child_lease_id" "$child_lease_holder" || return $?
+        child_lease_pending=1
       else
         echo "warning: child task $child_id predates durable Treehouse lease metadata; leaving recorded worktree $child_wt untouched and not returning it" >&2
       fi
@@ -2640,6 +2833,14 @@ cleanup_firstmate_home_children() {
     fi
     retire_busy_state "$sub_state" "$child_id" "$child_busy_gen" || return 1
     status_retire_presentation_task "$sub_state" "$child_id" || return 1
+    if [ "$child_lease_pending" = 1 ]; then
+      fm_treehouse_lease_journal_write "$child_journal" "$child_id" "$home" \
+        "$child_proj" "$child_backend" "$child_t" "$child_lease_holder" cleanup \
+        "$child_wt" "$child_lease_id" "$child_lease_holder" || {
+        echo "error: could not publish final Treehouse lease recovery state for child $child_id" >&2
+        return 1
+      }
+    fi
     fm_backlog_atomic_transition remove "$sub_state/$child_id.meta" "task record" "$sub_state" || return 1
     rm -f "$sub_state/$child_id.turn-ended" \
       "$sub_state/$child_id.pi-ext.ts" \
@@ -2648,6 +2849,13 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.cursor-session" "$sub_state/$child_id.reconcile-nudged" \
       "$sub_state/.$child_id.branch-outcome-index"
     rm -rf "$sub_state/$child_id.antigravity-hooks"
+    if [ "$child_lease_pending" = 1 ]; then
+      teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" "" \
+        "$child_lease_id" "$child_lease_holder" || return $?
+      fm_treehouse_lease_journal_remove "$child_journal" || {
+        echo "warning: child Treehouse lease returned, but redundant recovery journal remains at $child_journal" >&2
+      }
+    fi
   done
 }
 
@@ -2864,21 +3072,17 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ] && [ "$TREEHOUSE_LEASED" = 1 ]; then
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool only when Treehouse confirms both recorded lease identities. Treehouse
-  # resolves the pool from the working directory, so run it from the project.
-  # teardown_treehouse_return tolerates transient and stale git locks left by a
-  # killed crew process; see the script header for retry and stale-lock proof.
-  post_lock_cleanup_check=
-  if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
-    post_lock_cleanup_check=validate_worktree_teardown_safety
-  fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" \
-      "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+elif [ "$KIND" != secondmate ] && [ "$TREEHOUSE_LEASED" = 1 ]; then
+  # Lease return is deliberately deferred until every later refusal-capable
+  # cleanup and the task-record transition have succeeded. Validate its runtime
+  # prerequisites now, while the live task record can still be retained.
+  if ! { [ -d "$PROJ" ] && command -v treehouse >/dev/null 2>&1; }; then
+    echo "error: cannot return leased worktree $WT for $ID; project or treehouse is unavailable, so the lease and task record remain held" >&2
     exit 1
-  }
+  fi
+  if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ]; then
+    TREEHOUSE_POST_CLEANUP_CHECK=validate_worktree_teardown_safety
+  fi
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   echo "warning: task $ID predates durable Treehouse lease metadata; leaving recorded worktree $WT untouched and not returning it, so teardown cannot release a copy another task may now own" >&2
 fi
@@ -2989,6 +3193,14 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+if [ "$TREEHOUSE_LEASED" = 1 ]; then
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" cleanup \
+    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" || {
+    echo "error: could not publish final Treehouse lease recovery state for $ID; retaining the lease and task record" >&2
+    exit 1
+  }
+fi
 rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
@@ -3014,9 +3226,9 @@ if [ "$BACKLOG_CLOSED" = 1 ]; then
     fm_lock_release "$META_LOCK"
     META_LOCK_HELD=0
     if [ "$BACKLOG_TRANSITION" = retain ]; then
-      echo "error: $ID's endpoint and local copy are cleaned up, but its captain-held backlog item could not be returned to Queued atomically ($FM_BACKLOG_TRANSITION_ERROR); the pending retention is recorded and the next session start retries it" >&2
+      echo "error: $ID's endpoint is cleaned up, but its captain-held backlog item could not be returned to Queued atomically ($FM_BACKLOG_TRANSITION_ERROR); the Treehouse lease remains held, the pending retention is recorded, and the next session start retries it" >&2
     else
-      echo "error: $ID's endpoint and local copy are cleaned up, but its backlog item could not be closed atomically ($FM_BACKLOG_TRANSITION_ERROR); the pending close is recorded and the next session start retries it" >&2
+      echo "error: $ID's endpoint is cleaned up, but its backlog item could not be closed atomically ($FM_BACKLOG_TRANSITION_ERROR); the Treehouse lease remains held, the pending close is recorded, and the next session start retries it" >&2
     fi
     exit 1
   fi
@@ -3029,7 +3241,7 @@ else
   if ! fm_backlog_atomic_transition remove "$STATE/$ID.meta" "task record" "$STATE"; then
     fm_lock_release "$META_LOCK"
     META_LOCK_HELD=0
-    echo "error: $ID's endpoint and local copy are cleaned up, but its task record could not be removed ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    echo "error: $ID's endpoint is cleaned up, but its task record could not be removed ($FM_BACKLOG_TRANSITION_ERROR); the Treehouse lease remains held" >&2
     exit 1
   fi
 fi
@@ -3042,6 +3254,19 @@ fi
 # state directory. Do not let the side-band refresh recreate that retired home.
 if [ -d "$STATE" ]; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
+fi
+if [ "$TREEHOUSE_LEASED" = 1 ]; then
+  # This is the last refusal-capable cleanup operation. The ordinary task
+  # record is already retired, while the cleanup journal preserves the exact
+  # identity if return fails and a later teardown must resume here.
+  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$TREEHOUSE_POST_CLEANUP_CHECK" \
+      "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" || {
+    echo "error: treehouse return failed for worktree $WT; recovery state remains at $TREEHOUSE_LEASE_JOURNAL" >&2
+    exit 1
+  }
+  fm_treehouse_lease_journal_remove "$TREEHOUSE_LEASE_JOURNAL" || {
+    echo "warning: Treehouse lease returned, but redundant recovery journal remains at $TREEHOUSE_LEASE_JOURNAL" >&2
+  }
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
 backlog_refresh_reminder

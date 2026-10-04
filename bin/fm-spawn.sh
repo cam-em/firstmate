@@ -163,9 +163,13 @@
 #   --json --lease-holder <task-id>@<home>`. The returned lease id and holder are
 #   recorded in task meta, the pane explicitly cd's into that exact path, and a
 #   relaunch reuses the same recorded worktree and lease without acquiring a new
-#   slot. Legacy records without these fields remain readable and are never
-#   upgraded by resetting or reacquiring their copy; teardown owns their safe
-#   no-return migration behavior.
+#   slot. Before acquisition, state/<id>.treehouse-lease atomically records the
+#   intended holder and project; it advances with any observed lease identity,
+#   survives every failure after the request begins, and is removed only after
+#   the spawn commit. Teardown uses that journal to reconcile interrupted
+#   holder-only or exact-identity acquisition. Legacy records without lease
+#   fields remain readable and are never upgraded by resetting or reacquiring
+#   their copy; teardown owns their safe no-return migration behavior.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -336,6 +340,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-model-runtime-lib.sh
 . "$SCRIPT_DIR/fm-model-runtime-lib.sh"
+# shellcheck source=bin/fm-treehouse-lease-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lease-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -783,6 +789,9 @@ CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 TREEHOUSE_LEASE_ID=
 TREEHOUSE_LEASE_HOLDER=
+TREEHOUSE_LEASE_JOURNAL=
+TREEHOUSE_LEASE_JOURNAL_OWNED=0
+TREEHOUSE_LEASE_REQUESTED=0
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -813,6 +822,10 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ "$TREEHOUSE_LEASE_JOURNAL_OWNED" = 1 ] \
+     && [ "$TREEHOUSE_LEASE_REQUESTED" != 1 ]; then
+    fm_treehouse_lease_journal_remove "$TREEHOUSE_LEASE_JOURNAL" || true
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -2297,6 +2310,21 @@ if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
   exit 1
 fi
 
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  TREEHOUSE_LEASE_JOURNAL=$(fm_treehouse_lease_journal_path "$STATE" "$ID")
+  if [ -e "$TREEHOUSE_LEASE_JOURNAL" ] || [ -L "$TREEHOUSE_LEASE_JOURNAL" ]; then
+    echo "error: task $ID has an interrupted Treehouse lease acquisition at $TREEHOUSE_LEASE_JOURNAL; run fm-teardown.sh $ID to reconcile it before retrying spawn" >&2
+    exit 1
+  fi
+  TREEHOUSE_LEASE_HOLDER="$ID@$FM_HOME"
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ_ABS" "$BACKEND" "" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" || {
+    echo "error: could not publish Treehouse lease intent for task $ID before acquisition" >&2
+    exit 1
+  }
+  TREEHOUSE_LEASE_JOURNAL_OWNED=1
+fi
+
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   # Adopt the recorded endpoint instead of creating one. This is what keeps a
@@ -2664,25 +2692,40 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  TREEHOUSE_LEASE_HOLDER="$ID@$FM_HOME"
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" || {
+    echo "error: could not bind Treehouse lease intent to endpoint $T for task $ID" >&2
+    exit 1
+  }
+  TREEHOUSE_LEASE_REQUESTED=1
   if ! TREEHOUSE_LEASE_JSON=$(cd "$PROJ_ABS" \
       && treehouse get --lease --json --lease-holder "$TREEHOUSE_LEASE_HOLDER"); then
     echo "error: treehouse could not lease a worktree for task $ID" >&2
     exit 1
   fi
-  if ! TREEHOUSE_LEASE_RECORD=$(printf '%s\n' "$TREEHOUSE_LEASE_JSON" | jq -er '
-      select((.path | type) == "string" and (.path | length) > 0)
-      | select((.lease_id | type) == "string" and (.lease_id | length) > 0)
-      | select((.lease_holder | type) == "string" and (.lease_holder | length) > 0)
-      | [.path, .lease_id, .lease_holder]
-      | @tsv
+  if ! TREEHOUSE_LEASE_RECORD=$(printf '%s\n' "$TREEHOUSE_LEASE_JSON" | jq -cer '
+      if type == "object" then
+        {path: (.path | if type == "string" then . else "" end),
+         lease_id: (.lease_id | if type == "string" then . else "" end),
+         lease_holder: (.lease_holder | if type == "string" then . else "" end)}
+      else error("lease result is not an object") end
     '); then
     echo "error: treehouse leased a worktree for task $ID but returned malformed lease metadata; the lease holder is '$TREEHOUSE_LEASE_HOLDER' and must be reconciled before retrying" >&2
     exit 1
   fi
-  IFS=$'\t' read -r WT TREEHOUSE_LEASE_ID TREEHOUSE_REPORTED_HOLDER <<EOF
-$TREEHOUSE_LEASE_RECORD
-EOF
+  WT=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.path')
+  TREEHOUSE_LEASE_ID=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.lease_id')
+  TREEHOUSE_REPORTED_HOLDER=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.lease_holder')
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" observed \
+    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" || {
+    echo "error: treehouse leased a worktree for task $ID but its observed identity could not be journaled; reconcile holder '$TREEHOUSE_LEASE_HOLDER' before retrying" >&2
+    exit 1
+  }
+  if [ -z "$WT" ] || [ -z "$TREEHOUSE_LEASE_ID" ] || [ -z "$TREEHOUSE_REPORTED_HOLDER" ]; then
+    echo "error: treehouse leased a worktree for task $ID but returned incomplete lease metadata; the journal at $TREEHOUSE_LEASE_JOURNAL must be reconciled before retrying" >&2
+    exit 1
+  fi
   if [ "$TREEHOUSE_REPORTED_HOLDER" != "$TREEHOUSE_LEASE_HOLDER" ]; then
     echo "error: treehouse returned lease holder '$TREEHOUSE_REPORTED_HOLDER' for task $ID, expected '$TREEHOUSE_LEASE_HOLDER'; refusing to enter an ambiguously owned copy" >&2
     exit 1
@@ -2694,6 +2737,12 @@ EOF
       exit 1
       ;;
   esac
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" acquired \
+    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" || {
+    echo "error: treehouse lease identity for task $ID could not be committed to its recovery journal" >&2
+    exit 1
+  }
   spawn_send_text_line "$WT_TARGET" "cd -- $(shell_quote "$WT")"
 
   # Wait for the pane shell to cd into the exact durably leased worktree.
@@ -3267,6 +3316,14 @@ if [ "$RELAUNCH" -eq 0 ]; then
     echo "error: task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
     exit 1
   fi
+  if [ -n "$TREEHOUSE_LEASE_JOURNAL" ]; then
+    fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+      "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" published \
+      "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" || {
+      echo "error: task record for $ID was published but its Treehouse recovery journal could not advance; rolling the provisional task record back" >&2
+      exit 1
+    }
+  fi
   SPAWN_META_TMP=
 fi
 
@@ -3507,6 +3564,12 @@ if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
   esac
   echo "error: spawn of $ID was interrupted after launch delivery began; its paired task record and In-flight backlog state were preserved" >&2
   exit "$SPAWN_DEFERRED_SIGNAL_STATUS"
+fi
+
+if [ -n "$TREEHOUSE_LEASE_JOURNAL" ]; then
+  if ! fm_treehouse_lease_journal_remove "$TREEHOUSE_LEASE_JOURNAL"; then
+    echo "warning: task $ID launched with durable metadata, but its redundant Treehouse lease journal remains at $TREEHOUSE_LEASE_JOURNAL" >&2
+  fi
 fi
 
 SPAWN_DELIVERY=

@@ -7,8 +7,8 @@
 # 'MISSING: tasks-axi (install: ...)', 'MISSING: quota-axi (install: ...)',
 # 'MISSING: gh-axi (install: ...)', 'MISSING: lavish-axi (install: ...)', and
 # 'BOOTSTRAP_INFO: ...' lines, so those contracts are pinned verbatim. The cases
-# are table-driven over the inputs that vary: whether `treehouse get --help`
-# advertises --lease, which (if any) tasks-axi version is on PATH, whether
+# are table-driven over the inputs that vary: whether Treehouse advertises the
+# complete durable lease protocol, which (if any) tasks-axi version is on PATH, whether
 # tasks-axi update advertises --archive-body, whether its mv help advertises
 # multi-ID moves, whether quota-axi is on PATH,
 # whether the local backend config opts out of tasks-axi backlog mutations,
@@ -40,7 +40,9 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
   CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID 2>/dev/null || true
 
 # A fake toolchain where every required tool is present and gh is authenticated.
-# treehouse's `get --help` advertises --lease only when FM_FAKE_TREEHOUSE_LEASE_HELP=1.
+# Treehouse advertises the complete lease protocol only when
+# FM_FAKE_TREEHOUSE_LEASE_HELP=1; FM_FAKE_TREEHOUSE_MISSING_FLAG can selectively
+# remove one capability for the negative protocol matrix.
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -65,12 +67,35 @@ SH
   chmod +x "$fakebin/gh"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-}" = get ] && [ "${2:-}" = --help ]; then
-  if [ "${FM_FAKE_TREEHOUSE_LEASE_HELP:-}" = 1 ]; then
-    printf '%s\n' 'Usage: treehouse get [--lease] [--lease-holder <holder>]'
-  else
-    printf '%s\n' 'Usage: treehouse get'
-  fi
+missing=${FM_FAKE_TREEHOUSE_MISSING_FLAG:-}
+if [ "${2:-}" = --help ]; then
+  case "${1:-}" in
+    get)
+      printf '%s' 'Usage: treehouse get'
+      if [ "${FM_FAKE_TREEHOUSE_LEASE_HELP:-}" = 1 ]; then
+        [ "$missing" = get-lease ] || printf '%s' ' [--lease]'
+        [ "$missing" = get-json ] || printf '%s' ' [--json]'
+        [ "$missing" = get-lease-holder ] || printf '%s' ' [--lease-holder <holder>]'
+      fi
+      printf '\n'
+      ;;
+    return)
+      printf '%s' 'Usage: treehouse return'
+      if [ "${FM_FAKE_TREEHOUSE_LEASE_HELP:-}" = 1 ]; then
+        [ "$missing" = return-if-lease-id ] || printf '%s' ' [--if-lease-id <id>]'
+        [ "$missing" = return-if-lease-holder ] || printf '%s' ' [--if-lease-holder <holder>]'
+      fi
+      printf '\n'
+      ;;
+    status)
+      printf '%s' 'Usage: treehouse status'
+      if [ "${FM_FAKE_TREEHOUSE_LEASE_HELP:-}" = 1 ] \
+         && [ "$missing" != status-json ]; then
+        printf '%s' ' [--json]'
+      fi
+      printf '\n'
+      ;;
+  esac
   exit 0
 fi
 exit 0
@@ -87,6 +112,7 @@ SH
   chmod +x "$fakebin/no-mistakes"
   add_tasks_axi "$fakebin" "0.2.4"
   add_quota_axi "$fakebin"
+  add_real_jq "$fakebin"
   printf '%s\n' "$fakebin"
 }
 
@@ -714,6 +740,45 @@ test_treehouse_lease_check_follows_resolved_backend() {
   pass "bootstrap: the treehouse lease check follows the resolved backend's worktree provider"
 }
 
+test_treehouse_lease_protocol_and_jq_are_required() {
+  local capability case_dir fakebin out bash_env
+  for capability in get-lease get-json get-lease-holder \
+      return-if-lease-id return-if-lease-holder status-json; do
+    case_dir="$TMP_ROOT/treehouse-missing-$capability"
+    mkdir -p "$case_dir/home/config"
+    printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+    fakebin=$(make_fake_toolchain "$case_dir")
+    out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_TREEHOUSE_MISSING_FLAG="$capability" \
+      "$ROOT/bin/fm-bootstrap.sh")
+    assert_contains "$out" "MISSING: treehouse" \
+      "bootstrap accepted Treehouse without required capability $capability"
+  done
+
+  case_dir="$TMP_ROOT/treehouse-missing-jq"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  bash_env="$case_dir/no-jq.bash"
+  cat > "$bash_env" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = jq ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+jq() {
+  return 127
+}
+SH
+  out=$(PATH="$fakebin:$BASE_PATH" BASH_ENV="$bash_env" \
+    FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: jq" \
+    "bootstrap accepted the Treehouse-backed tmux backend without jq"
+  pass "bootstrap: every Treehouse lease protocol capability and jq are required"
+}
+
 test_fleet_sync_timeout_scales_with_origin_backed_project_count() {
   local case_dir home fakebin fake_root out
   case_dir="$TMP_ROOT/fleet-timeout-scaled"
@@ -1168,6 +1233,7 @@ test_cmux_bundled_cli_satisfies_dependency
 test_unknown_backend_reports_invalid_configuration
 test_json_backends_require_jq_not_tmux
 test_treehouse_lease_check_follows_resolved_backend
+test_treehouse_lease_protocol_and_jq_are_required
 test_fleet_sync_timeout_scales_with_origin_backed_project_count
 test_fleet_sync_timeout_floor_preserves_small_fleets
 test_fleet_sync_timeout_explicit_override_wins

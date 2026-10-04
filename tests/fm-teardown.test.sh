@@ -657,6 +657,86 @@ SH
   pass "teardown refusals preserve the durable Treehouse lease"
 }
 
+test_late_cleanup_refusal_keeps_the_treehouse_lease() {
+  local case_dir log out rc
+  case_dir=$(make_case lease-late-refusal)
+  mkdir -p "$case_dir/home"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'busy_gen=expected-gen' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' 'different-gen' > "$case_dir/state/task-x1.busy-gen"
+  log="$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  out=$(
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    FM_HOME="$case_dir/home" run_teardown "$case_dir" --force 2>&1
+  ) || rc=$?
+  [ "$rc" -ne 0 ] || fail "late cleanup failure unexpectedly completed teardown"
+  assert_contains "$out" "stale busy-state gen" \
+    "late cleanup failure did not reach the injected busy-state refusal"
+  [ ! -s "$log" ] || fail "late cleanup refusal released the Treehouse lease"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "late cleanup refusal removed task metadata"
+  pass "a refusal-capable helper after endpoint cleanup runs before Treehouse lease return"
+}
+
+test_failed_final_return_recovers_from_cleanup_journal() {
+  local case_dir journal rc
+  case_dir=$(make_case lease-final-return-recovery)
+  mkdir -p "$case_dir/home"
+  write_meta "$case_dir" local-only ship
+  : > "$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  status)
+    printf '[{"path":"%s","status":"leased","lease_id":"lease-task-x1","lease_holder":"task-x1@test-home"}]\n' '$case_dir/wt'
+    ;;
+  return)
+    printf '%s\n' "\$*" >> '$case_dir/treehouse.log'
+    [ -e '$case_dir/allow-return' ] || exit 1
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    FM_HOME="$case_dir/home" run_teardown "$case_dir" --force \
+      > "$case_dir/first.stdout" 2> "$case_dir/first.stderr"
+  ) || rc=$?
+  [ "$rc" -ne 0 ] || fail "final-return-recovery: injected Treehouse failure unexpectedly succeeded"
+  journal="$case_dir/state/task-x1.treehouse-lease"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "final-return-recovery: completed record cleanup was rolled back"
+  assert_present "$journal" \
+    "final-return-recovery: failed final return left no recovery journal"
+  assert_grep 'phase=cleanup' "$journal" \
+    "final-return-recovery: journal did not identify the cleanup phase"
+
+  : > "$case_dir/allow-return"
+  rc=0
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    FM_HOME="$case_dir/home" run_teardown "$case_dir" --force \
+      > "$case_dir/retry.stdout" 2> "$case_dir/retry.stderr"
+  ) || rc=$?
+  expect_code 0 "$rc" "final-return-recovery: journal-only retry should succeed"
+  assert_absent "$journal" \
+    "final-return-recovery: successful retry retained the recovery journal"
+  assert_grep "return --force --if-lease-id lease-task-x1 --if-lease-holder task-x1@test-home $case_dir/wt" \
+    "$case_dir/treehouse.log" \
+    "final-return-recovery: retry did not use the exact recorded identities"
+  pass "a failed final Treehouse return resumes from the cleanup journal"
+}
+
 test_legacy_unleased_teardown_never_returns_or_mutates_the_copy() {
   local case_dir log out rc branch meta_tmp
   case_dir=$(make_case legacy-unleased)
@@ -1330,8 +1410,10 @@ test_persistent_index_lock_exhausts_retries_and_refuses_loudly() {
   assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
     "persistent-index-lock: teardown removed a non-stale lock"
   [ -e "$lock" ] || fail "persistent-index-lock: lock file was removed"
-  [ -f "$case_dir/state/task-x1.meta" ] \
-    || fail "persistent-index-lock: teardown completed despite persistent lock"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "persistent-index-lock: final return failure restored a retired task record"
+  assert_grep 'phase=cleanup' "$case_dir/state/task-x1.treehouse-lease" \
+    "persistent-index-lock: final return failure left no exact recovery identity"
   pass "persistent index.lock exhausts retries and refuses without force-removing the lock"
 }
 
@@ -2012,6 +2094,41 @@ SH
       "descendant-locks: cleanup did not guard $child's return with its lease identity"
   done
   pass "forced secondmate teardown holds every descendant lifecycle and metadata lock"
+}
+
+test_forced_descendant_late_refusal_keeps_child_leases() {
+  local case_dir home rc
+  case_dir=$(make_case descendant-late-refusal)
+  mkdir -p "$case_dir/home"
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_tmux_children "$case_dir"
+  home="$case_dir/secondmate-home"
+  printf '%s\n' 'busy_gen=expected-gen' >> "$home/state/child-a.meta"
+  printf '%s\n' 'different-gen' > "$home/state/child-a.busy-gen"
+  : > "$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/treehouse.log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  rc=0
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    FM_HOME="$case_dir/home" run_teardown "$case_dir" --force \
+      > "$case_dir/stdout" 2> "$case_dir/stderr"
+  ) || rc=$?
+  [ "$rc" -ne 0 ] || fail "descendant-late-refusal: teardown unexpectedly succeeded"
+  assert_grep "stale busy-state gen" "$case_dir/stderr" \
+    "descendant-late-refusal: injected child cleanup refusal did not run"
+  [ ! -s "$case_dir/treehouse.log" ] \
+    || fail "descendant-late-refusal: child lease returned before later cleanup refused"
+  assert_present "$home/state/child-a.meta" \
+    "descendant-late-refusal: refusal removed the child task record"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "descendant-late-refusal: refusal removed the parent task record"
+  pass "forced descendant cleanup keeps every child lease when a later helper refuses"
 }
 
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed() {
@@ -3282,6 +3399,8 @@ EOF
 test_local_only_fork_remote_allows
 test_teardown_returns_only_the_recorded_treehouse_lease
 test_teardown_refusal_keeps_the_treehouse_lease
+test_late_cleanup_refusal_keeps_the_treehouse_lease
+test_failed_final_return_recovers_from_cleanup_journal
 test_legacy_unleased_teardown_never_returns_or_mutates_the_copy
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
@@ -3299,6 +3418,7 @@ test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
+test_forced_descendant_late_refusal_keeps_child_leases
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
