@@ -59,6 +59,7 @@ case "${1:-}" in
     fi
     case "${FM_FAKE_FAILURE_MODE:?}" in
       slow)
+        printf '%s\n' "$$" > "${FM_FAKE_SLOW_REQUEST_PID:?}"
         : > "${FM_FAKE_SLOW_STARTED:?}"
         while [ ! -f "${FM_FAKE_SLOW_RELEASE:?}" ]; do
           /bin/sleep 0.05
@@ -158,6 +159,7 @@ EOF
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
+      FM_FAKE_SLOW_REQUEST_PID="$case_dir/slow.request-pid" \
       PATH="$fakebin:$PATH" \
       "$SPAWN" "$id" "$project" --mode no-mistakes --yolo off 2>&1
   ) || rc=$?
@@ -183,9 +185,33 @@ EOF
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
+      FM_FAKE_SLOW_REQUEST_PID="$case_dir/slow.request-pid" \
       PATH="$fakebin:$PATH" \
       "$TEARDOWN" "$id" ${force:+"$force"} 2>&1
   )
+}
+
+write_v3_journal() {  # <journal> <id> <home> <project> <phase> <worktree> <lease-id> <lease-holder> <state> <helper-pid> <helper-start> <request-pid> <request-start>
+  local journal=$1 id=$2 home=$3 project=$4 phase=$5 worktree=$6 lease_id=$7 lease_holder=$8
+  local state=$9 helper_pid=${10} helper_start=${11} request_pid=${12} request_start=${13}
+  cat > "$journal" <<EOF
+schema=fm-treehouse-task-lease.v3
+task_id=$id
+home=$home
+project=$project
+backend=tmux
+target=firstmate:fm-$id
+requested_holder=$id@$home
+phase=$phase
+worktree=$worktree
+lease_id=$lease_id
+lease_holder=$lease_holder
+acquisition_state=$state
+acquisition_pid=$helper_pid
+acquisition_identity=$helper_start
+request_pid=$request_pid
+request_identity=$request_start
+EOF
 }
 
 test_failure_journals_are_recoverable() {
@@ -279,7 +305,8 @@ EOF
       FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
-      FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" PATH="$fakebin:$PATH" \
+      FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
+      FM_FAKE_SLOW_REQUEST_PID="$case_dir/slow.request-pid" PATH="$fakebin:$PATH" \
       "$SPAWN" "$id" "$project" --mode no-mistakes --yolo off
   ) > "$case_dir/spawn.out" 2>&1 &
   spawn_pid=$!
@@ -304,8 +331,8 @@ EOF
   rc=0
   out=$(run_recovery "$record" "$id" "") || rc=$?
   [ "$rc" -ne 0 ] || fail "parent-crash: recovery succeeded while acquisition helper was live"
-  assert_contains "$out" "still running in helper pid $helper_pid" \
-    "parent-crash: recovery did not identify the live acquisition helper"
+  assert_contains "$out" "still has its exact" \
+    "parent-crash: recovery did not identify a live acquisition process"
   assert_present "$journal" \
     "parent-crash: refused recovery removed the helper's only durable journal"
   assert_absent "$case_dir/slow.lease" \
@@ -320,8 +347,8 @@ EOF
     "parent-crash: surviving acquisition helper did not complete after release"
   kill -0 "$helper_pid" 2>/dev/null \
     && fail "parent-crash: acquisition helper remained live after publishing its result"
-  assert_grep 'phase=observed' "$journal" \
-    "parent-crash: helper did not durably publish the observed lease"
+  assert_present "$journal" \
+    "parent-crash: completed request lost its recovery journal"
 
   rc=0
   out=$(run_recovery "$record" "$id" "") || rc=$?
@@ -331,6 +358,149 @@ EOF
     "$case_dir/treehouse.log" \
     "parent-crash: recovery did not return the exact late-created lease"
   pass "in-flight Treehouse acquisition survives parent spawn crash until exact recovery"
+}
+
+test_request_survives_helper_crash_without_losing_journal() {
+  local id record case_dir home project worktree fakebin journal out rc spawn_pid helper_pid request_pid returns
+  id=lease-helper-crash
+  record=$(make_case helper-crash "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    exec env FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+      FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_SPAWN_NO_GUARD=1 \
+      FM_FAKE_FAILURE_MODE=slow FM_FAKE_TASK_ID="$id" \
+      FM_FAKE_STATE="$home/state" FM_FAKE_PROJECT="$project" \
+      FM_FAKE_WORKTREE="$worktree" FM_FAKE_TREEHOUSE_PATH="$worktree" \
+      FM_FAKE_EXPECTED_HOLDER="$id@$home" FM_FAKE_JOURNAL="$journal" \
+      FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
+      FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
+      FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
+      FM_FAKE_SLOW_REQUEST_PID="$case_dir/slow.request-pid" PATH="$fakebin:$PATH" \
+      "$SPAWN" "$id" "$project" --mode no-mistakes --yolo off
+  ) > "$case_dir/spawn.out" 2>&1 &
+  spawn_pid=$!
+
+  for _ in $(seq 1 200); do
+    [ -f "$case_dir/slow.started" ] && grep -Fxq 'acquisition_state=running' "$journal" 2>/dev/null && break
+    /bin/sleep 0.01
+  done
+  assert_present "$case_dir/slow.started" \
+    "helper-crash: fake Treehouse get never reached its blocked acquisition"
+  assert_grep 'acquisition_state=running' "$journal" \
+    "helper-crash: request process identity was not durable before get"
+  helper_pid=$(sed -n 's/^acquisition_pid=//p' "$journal")
+  request_pid=$(sed -n 's/^request_pid=//p' "$journal")
+  [ "$request_pid" = "$(cat "$case_dir/slow.request-pid")" ] \
+    || fail "helper-crash: journal did not identify the actual Treehouse request process"
+
+  kill -KILL "$spawn_pid"
+  wait "$spawn_pid" 2>/dev/null || true
+  kill -KILL "$helper_pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    kill -0 "$helper_pid" 2>/dev/null || break
+    /bin/sleep 0.01
+  done
+  kill -0 "$request_pid" 2>/dev/null \
+    || fail "helper-crash: Treehouse request did not survive its helper as required by the regression"
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  [ "$rc" -ne 0 ] || fail "helper-crash: recovery erased a journal while its request was live"
+  assert_contains "$out" "exact request pid $request_pid" \
+    "helper-crash: recovery did not name the surviving request"
+  assert_present "$journal" \
+    "helper-crash: refused recovery removed the request's only durable journal"
+  assert_absent "$case_dir/slow.lease" \
+    "helper-crash: blocked request completed before release"
+
+  : > "$case_dir/slow.release"
+  for _ in $(seq 1 200); do
+    [ -f "$case_dir/slow.lease" ] && ! kill -0 "$request_pid" 2>/dev/null && break
+    /bin/sleep 0.01
+  done
+  assert_present "$case_dir/slow.lease" \
+    "helper-crash: surviving request did not publish its lease after release"
+  kill -0 "$request_pid" 2>/dev/null \
+    && fail "helper-crash: request remained live after publishing its lease"
+  assert_grep 'phase=intent' "$journal" \
+    "helper-crash: an absent helper unexpectedly advanced the journal"
+
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  expect_code 0 "$rc" "helper-crash: completed request should recover its exact lease"
+  assert_absent "$journal" "helper-crash: successful recovery left its journal"
+  returns=$(grep -c '^return ' "$case_dir/treehouse.log" 2>/dev/null || true)
+  [ "$returns" -eq 1 ] || fail "helper-crash: exact recovery returned the lease $returns times"
+  pass "a Treehouse request that outlives its helper retains recoverable ownership"
+}
+
+test_crash_point_before_get_is_safe() {
+  local id record case_dir home project worktree fakebin journal out rc
+  id=lease-crash-before-get
+  record=$(make_case crash-before-get "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  write_v3_journal "$journal" "$id" "$home" "$project" intent "" "" "" \
+    not-started "" "" "" ""
+  : > "$case_dir/slow.started"
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  expect_code 0 "$rc" "before-get: a never-released request should settle empty"
+  assert_absent "$journal" "before-get: empty never-started intent was not retired"
+  assert_contains "$out" "no active Treehouse lease remained" \
+    "before-get: recovery did not report the empty holder state"
+  pass "crash before get clears only a proven never-started intent"
+}
+
+test_crash_point_after_get_before_meta_is_safe() {
+  local id record case_dir home project worktree fakebin journal out rc
+  id=lease-crash-after-get
+  record=$(make_case crash-after-get "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  write_v3_journal "$journal" "$id" "$home" "$project" observed "$worktree" \
+    "lease-$id" "$id@$home" finished 99999991 dead-helper-start \
+    99999992 dead-request-start
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  expect_code 0 "$rc" "after-get: observed lease should be returned before metadata exists"
+  assert_absent "$journal" "after-get: recovered observed lease left its journal"
+  assert_grep "return --force --if-lease-id lease-$id --if-lease-holder $id@$home $worktree" \
+    "$case_dir/treehouse.log" "after-get: recovery did not return the observed lease"
+  pass "crash after get and before metadata returns the observed lease"
+}
+
+test_crash_point_after_meta_requires_force() {
+  local id record case_dir home project worktree fakebin journal out rc
+  id=lease-crash-after-meta
+  record=$(make_case crash-after-meta "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  write_v3_journal "$journal" "$id" "$home" "$project" published "$worktree" \
+    "lease-$id" "$id@$home" finished 99999991 dead-helper-start \
+    99999992 dead-request-start
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  [ "$rc" -ne 0 ] || fail "after-meta: published lease recovered without discard authority"
+  assert_contains "$out" "rerun with --force" \
+    "after-meta: refusal did not preserve the launched-worker gate"
+  assert_present "$journal" "after-meta: refusal removed the published journal"
+  rc=0
+  out=$(run_recovery "$record" "$id" --force) || rc=$?
+  expect_code 0 "$rc" "after-meta: forced published recovery should return the exact lease"
+  assert_absent "$journal" "after-meta: successful recovery left its journal"
+  pass "crash after metadata publication retains the force-gated exact return"
 }
 
 test_legacy_intent_without_helper_identity_is_preserved() {
@@ -358,7 +528,7 @@ EOF
   rc=0
   out=$(run_recovery "$record" "$id" "") || rc=$?
   [ "$rc" -ne 0 ] || fail "legacy-intent: recovery erased an acquisition with no completion proof"
-  assert_contains "$out" "has no helper identity proving the request is finished" \
+  assert_contains "$out" "completion for $id cannot be proven" \
     "legacy-intent: refusal did not explain the conservative migration behavior"
   assert_present "$journal" \
     "legacy-intent: an empty status removed the only recovery evidence"
@@ -369,7 +539,11 @@ EOF
 
 test_failure_journals_are_recoverable
 test_existing_recovery_journal_is_never_replaced
+test_crash_point_before_get_is_safe
 test_inflight_acquisition_survives_parent_spawn_crash
+test_request_survives_helper_crash_without_losing_journal
+test_crash_point_after_get_before_meta_is_safe
+test_crash_point_after_meta_requires_force
 test_legacy_intent_without_helper_identity_is_preserved
 
 echo "# all fm-spawn-lease-recovery tests passed"

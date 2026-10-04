@@ -165,10 +165,11 @@
 #   relaunch reuses the same recorded worktree and lease without acquiring a new
 #   slot. Before acquisition, state/<id>.treehouse-lease atomically records the
 #   intended holder and project; it advances with any observed lease identity,
-#   records the acquisition helper's exact process identity before the request
-#   can begin, survives every failure after the request begins, and is removed
-#   only after the spawn commit. Teardown refuses recovery while that exact
-#   helper remains live, then uses the journal to reconcile interrupted
+#   records exact start identities for both the acquisition helper and a gated
+#   request process before `treehouse get` can begin, survives every failure
+#   after the request begins, and is removed only after the spawn commit.
+#   Teardown refuses recovery while either exact process remains live, then
+#   uses the journal to reconcile interrupted
 #   holder-only or exact-identity acquisition. Legacy records without lease
 #   fields remain readable and are never upgraded by resetting or reacquiring
 #   their copy; teardown owns their safe no-return migration behavior.
@@ -796,6 +797,8 @@ TREEHOUSE_LEASE_JOURNAL_OWNED=0
 TREEHOUSE_LEASE_REQUESTED=0
 TREEHOUSE_LEASE_ACQUISITION_PID=
 TREEHOUSE_LEASE_ACQUISITION_IDENTITY=
+TREEHOUSE_LEASE_REQUEST_PID=
+TREEHOUSE_LEASE_REQUEST_IDENTITY=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -826,20 +829,56 @@ parse_orca_worktree_result() {
 
 treehouse_lease_acquire_helper() {  # <journal> <project> <target> <holder> <gate> <parent-pid> <parent-identity>
   local journal=$1 project=$2 target=$3 holder=$4 gate=$5 parent_pid=$6 parent_identity=$7
-  local current_parent lease_json lease_record worktree lease_id reported_holder helper_pid helper_identity
+  local current_parent current_helper lease_json lease_record worktree lease_id reported_holder
+  local helper_pid helper_identity request_pid request_identity request_gate request_output request_status
   helper_pid=${BASHPID:-$$}
-  helper_identity=$(fm_pid_identity "$helper_pid") || return 70
+  helper_identity=$(fm_treehouse_process_start_identity "$helper_pid") || return 70
   while [ ! -d "$gate" ]; do
-    current_parent=$(fm_pid_identity "$parent_pid" 2>/dev/null) || return 70
+    current_parent=$(fm_treehouse_process_start_identity "$parent_pid" 2>/dev/null) || return 70
     [ "$current_parent" = "$parent_identity" ] || return 70
     sleep 0.05
   done
   rmdir "$gate" 2>/dev/null || return 70
-  if ! lease_json=$(cd "$project" \
-      && treehouse get --lease --json --lease-holder "$holder"); then
+  request_gate="$journal.request-go.$helper_pid"
+  request_output="$journal.request-output.$helper_pid"
+  rm -rf -- "$request_gate"
+  rm -f -- "$request_output"
+  (
+    while [ ! -d "$request_gate" ]; do
+      current_helper=$(fm_treehouse_process_start_identity "$helper_pid" 2>/dev/null) || exit 70
+      [ "$current_helper" = "$helper_identity" ] || exit 70
+      sleep 0.05
+    done
+    rmdir "$request_gate" 2>/dev/null || exit 70
+    cd "$project" || exit 72
+    exec treehouse get --lease --json --lease-holder "$holder"
+  ) > "$request_output" &
+  request_pid=$!
+  request_identity=$(fm_treehouse_process_start_identity "$request_pid") || {
+    kill "$request_pid" 2>/dev/null || true
+    wait "$request_pid" 2>/dev/null || true
+    return 70
+  }
+  fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
+    "$project" "$BACKEND" "$target" "$holder" intent "" "" "" \
+    running "$helper_pid" "$helper_identity" "$request_pid" "$request_identity" || {
+    kill "$request_pid" 2>/dev/null || true
+    wait "$request_pid" 2>/dev/null || true
+    return 71
+  }
+  mkdir "$request_gate" || {
+    kill "$request_pid" 2>/dev/null || true
+    wait "$request_pid" 2>/dev/null || true
+    return 70
+  }
+  request_status=0
+  wait "$request_pid" || request_status=$?
+  lease_json=$(cat "$request_output" 2>/dev/null || true)
+  rm -f -- "$request_output"
+  if [ "$request_status" -ne 0 ]; then
     fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
       "$project" "$BACKEND" "$target" "$holder" settled "" "" "" \
-      finished "$helper_pid" "$helper_identity" || return 71
+      finished "$helper_pid" "$helper_identity" "$request_pid" "$request_identity" || return 71
     return 1
   fi
   if ! lease_record=$(printf '%s\n' "$lease_json" | jq -cer '
@@ -851,7 +890,7 @@ treehouse_lease_acquire_helper() {  # <journal> <project> <target> <holder> <gat
     '); then
     fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
       "$project" "$BACKEND" "$target" "$holder" settled "" "" "" \
-      finished "$helper_pid" "$helper_identity" || return 71
+      finished "$helper_pid" "$helper_identity" "$request_pid" "$request_identity" || return 71
     return 2
   fi
   worktree=$(printf '%s\n' "$lease_record" | jq -r '.path')
@@ -860,7 +899,7 @@ treehouse_lease_acquire_helper() {  # <journal> <project> <target> <holder> <gat
   fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
     "$project" "$BACKEND" "$target" "$holder" observed \
     "$worktree" "$lease_id" "$reported_holder" finished \
-    "$helper_pid" "$helper_identity" || return 71
+    "$helper_pid" "$helper_identity" "$request_pid" "$request_identity" || return 71
 }
 
 spawn_abort_cleanup() {
@@ -2362,7 +2401,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ];
   TREEHOUSE_LEASE_HOLDER="$ID@$FM_HOME"
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ_ABS" "$BACKEND" "" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
-    not-started "" "" || {
+    not-started "" "" "" "" || {
     echo "error: could not publish Treehouse lease intent for task $ID before acquisition" >&2
     exit 1
   }
@@ -2738,14 +2777,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
-    not-started "" "" || {
+    not-started "" "" "" "" || {
     echo "error: could not bind Treehouse lease intent to endpoint $T for task $ID" >&2
     exit 1
   }
   TREEHOUSE_LEASE_GATE="$TREEHOUSE_LEASE_JOURNAL.acquire-go"
   rm -rf -- "$TREEHOUSE_LEASE_GATE"
   TREEHOUSE_LEASE_PARENT_PID=$(fm_current_pid)
-  TREEHOUSE_LEASE_PARENT_IDENTITY=$(fm_pid_identity "$TREEHOUSE_LEASE_PARENT_PID") || {
+  TREEHOUSE_LEASE_PARENT_IDENTITY=$(fm_treehouse_process_start_identity "$TREEHOUSE_LEASE_PARENT_PID") || {
     echo "error: could not identify the spawn process before Treehouse lease acquisition for task $ID" >&2
     exit 1
   }
@@ -2753,7 +2792,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     "$TREEHOUSE_LEASE_HOLDER" "$TREEHOUSE_LEASE_GATE" \
     "$TREEHOUSE_LEASE_PARENT_PID" "$TREEHOUSE_LEASE_PARENT_IDENTITY" &
   TREEHOUSE_LEASE_ACQUISITION_PID=$!
-  TREEHOUSE_LEASE_ACQUISITION_IDENTITY=$(fm_pid_identity "$TREEHOUSE_LEASE_ACQUISITION_PID") || {
+  TREEHOUSE_LEASE_ACQUISITION_IDENTITY=$(fm_treehouse_process_start_identity "$TREEHOUSE_LEASE_ACQUISITION_PID") || {
     kill "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
     wait "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
     echo "error: could not identify the Treehouse acquisition helper for task $ID" >&2
@@ -2762,8 +2801,8 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   TREEHOUSE_LEASE_REQUESTED=1
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
-    running "$TREEHOUSE_LEASE_ACQUISITION_PID" \
-    "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
+    helper-ready "$TREEHOUSE_LEASE_ACQUISITION_PID" \
+    "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" "" "" || {
     kill "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
     wait "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
     echo "error: could not publish the Treehouse acquisition helper identity for task $ID" >&2
@@ -2797,6 +2836,8 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   WT=$FM_TREEHOUSE_LEASE_WORKTREE
   TREEHOUSE_LEASE_ID=$FM_TREEHOUSE_LEASE_ID
   TREEHOUSE_REPORTED_HOLDER=$FM_TREEHOUSE_LEASE_HOLDER
+  TREEHOUSE_LEASE_REQUEST_PID=$FM_TREEHOUSE_LEASE_REQUEST_PID
+  TREEHOUSE_LEASE_REQUEST_IDENTITY=$FM_TREEHOUSE_LEASE_REQUEST_IDENTITY
   if [ -z "$WT" ] || [ -z "$TREEHOUSE_LEASE_ID" ] || [ -z "$TREEHOUSE_REPORTED_HOLDER" ]; then
     echo "error: treehouse leased a worktree for task $ID but returned incomplete lease metadata; the journal at $TREEHOUSE_LEASE_JOURNAL must be reconciled before retrying" >&2
     exit 1
@@ -2815,7 +2856,8 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" acquired \
     "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" finished \
-    "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
+    "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" \
+    "$TREEHOUSE_LEASE_REQUEST_PID" "$TREEHOUSE_LEASE_REQUEST_IDENTITY" || {
     echo "error: treehouse lease identity for task $ID could not be committed to its recovery journal" >&2
     exit 1
   }
@@ -3396,7 +3438,8 @@ if [ "$RELAUNCH" -eq 0 ]; then
     fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
       "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" published \
       "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" finished \
-      "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
+      "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" \
+      "$TREEHOUSE_LEASE_REQUEST_PID" "$TREEHOUSE_LEASE_REQUEST_IDENTITY" || {
       echo "error: task record for $ID was published but its Treehouse recovery journal could not advance; rolling the provisional task record back" >&2
       exit 1
     }

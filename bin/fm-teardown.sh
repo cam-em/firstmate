@@ -58,13 +58,14 @@
 # Before retiring the ordinary record, teardown atomically publishes
 # state/<id>.treehouse-lease in phase=cleanup. The journal survives a failed
 # final return and lets a later teardown reconcile the exact lease after the
-# ordinary record is gone. Spawn-side journals record the exact acquisition
-# helper identity before `treehouse get` may begin. Recovery refuses while that
-# exact helper remains live, then reloads the journal and reconciles its holder
-# through `treehouse status --json`; acquired or published journals require
-# --force because a worker may already have started. Legacy v1 intent journals
-# lack proof that an acquisition has stopped, so an empty status preserves them
-# for manual reconciliation instead of risking a late orphan lease. Existing
+# ordinary record is gone. Spawn-side journals record exact process-start
+# identities for both the helper and gated request before `treehouse get` may
+# begin. Recovery refuses while either exact process remains live and preserves
+# older running journals that cannot prove request completion, then reconciles
+# the holder through `treehouse status --json`; acquired or published journals
+# require --force because a worker may already have started. Legacy v1 intent
+# journals lack all process proof, so they remain for manual reconciliation
+# instead of risking a late orphan lease. Existing
 # records without lease identity retain the migration behavior below and never
 # cause teardown to return a possibly reassigned copy.
 # Legacy records with neither field are migration-safe: after all ordinary work
@@ -341,7 +342,7 @@ fi
 recover_treehouse_lease_journal() {  # <journal> <task-id> <expected-home> <force>
   local journal=$1 task_id=$2 expected_home=$3 force=${4:-}
   local status_json match_record match_count current_path current_id current_holder lookup_id
-  local current_identity acquisition_helper_dead=0
+  local current_identity acquisition_proven=0 identity_reader process_snapshot refreshed_snapshot
   fm_treehouse_lease_journal_load "$journal" "$task_id" || {
     echo "error: Treehouse lease recovery journal is malformed: $journal" >&2
     return 1
@@ -350,43 +351,66 @@ recover_treehouse_lease_journal() {  # <journal> <task-id> <expected-home> <forc
     echo "error: Treehouse lease recovery journal for $task_id belongs to home $FM_TREEHOUSE_LEASE_HOME, not $expected_home" >&2
     return 1
   }
-  if [ "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" = running ]; then
-    current_identity=$(fm_pid_identity "$FM_TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true)
-    if [ -n "$current_identity" ] \
-       && [ "$current_identity" = "$FM_TREEHOUSE_LEASE_ACQUISITION_IDENTITY" ]; then
-      echo "REFUSED: Treehouse lease acquisition for $task_id is still running in helper pid $FM_TREEHOUSE_LEASE_ACQUISITION_PID; retry teardown after it finishes" >&2
-      return 1
-    fi
-    if fm_pid_alive "$FM_TREEHOUSE_LEASE_ACQUISITION_PID" \
-       && [ -z "$current_identity" ]; then
-      echo "REFUSED: Treehouse lease acquisition helper pid $FM_TREEHOUSE_LEASE_ACQUISITION_PID for $task_id is live but its process identity is unreadable; preserving $journal" >&2
-      return 1
-    fi
-    acquisition_helper_dead=1
-    fm_treehouse_lease_journal_load "$journal" "$task_id" || {
-      echo "error: Treehouse lease recovery journal became malformed while checking its acquisition helper: $journal" >&2
-      return 1
-    }
-    [ "$FM_TREEHOUSE_LEASE_HOME" = "$expected_home" ] || {
-      echo "error: Treehouse lease recovery journal for $task_id changed homes during recovery" >&2
-      return 1
-    }
-    if [ "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" = running ]; then
-      current_identity=$(fm_pid_identity "$FM_TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true)
+  identity_reader=fm_treehouse_process_start_identity
+  [ "$FM_TREEHOUSE_LEASE_PROCESS_PROOF" != helper-only ] || identity_reader=fm_pid_identity
+  case "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" in
+    not-started|not-applicable)
+      acquisition_proven=1
+      ;;
+    helper-ready|running|finished)
+      current_identity=$($identity_reader "$FM_TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true)
       if [ -n "$current_identity" ] \
          && [ "$current_identity" = "$FM_TREEHOUSE_LEASE_ACQUISITION_IDENTITY" ]; then
-        echo "REFUSED: Treehouse lease acquisition for $task_id resumed while recovery was checking it; retry teardown after it finishes" >&2
+        echo "REFUSED: Treehouse lease acquisition for $task_id still has its exact helper pid $FM_TREEHOUSE_LEASE_ACQUISITION_PID; retry teardown after it exits" >&2
         return 1
       fi
       if fm_pid_alive "$FM_TREEHOUSE_LEASE_ACQUISITION_PID" \
          && [ -z "$current_identity" ]; then
-        echo "REFUSED: Treehouse lease acquisition helper pid $FM_TREEHOUSE_LEASE_ACQUISITION_PID for $task_id became unreadable during recovery; preserving $journal" >&2
+        echo "REFUSED: Treehouse lease acquisition helper pid $FM_TREEHOUSE_LEASE_ACQUISITION_PID for $task_id is live but its start identity is unreadable; preserving $journal" >&2
         return 1
       fi
-    else
-      acquisition_helper_dead=0
-    fi
+      if [ "$FM_TREEHOUSE_LEASE_PROCESS_PROOF" = complete ] \
+         && [ -n "$FM_TREEHOUSE_LEASE_REQUEST_PID" ]; then
+        current_identity=$(fm_treehouse_process_start_identity "$FM_TREEHOUSE_LEASE_REQUEST_PID" 2>/dev/null || true)
+        if [ -n "$current_identity" ] \
+           && [ "$current_identity" = "$FM_TREEHOUSE_LEASE_REQUEST_IDENTITY" ]; then
+          echo "REFUSED: Treehouse lease acquisition for $task_id still has its exact request pid $FM_TREEHOUSE_LEASE_REQUEST_PID; retry teardown after it exits" >&2
+          return 1
+        fi
+        if fm_pid_alive "$FM_TREEHOUSE_LEASE_REQUEST_PID" \
+           && [ -z "$current_identity" ]; then
+          echo "REFUSED: Treehouse lease request pid $FM_TREEHOUSE_LEASE_REQUEST_PID for $task_id is live but its start identity is unreadable; preserving $journal" >&2
+          return 1
+        fi
+      fi
+      case "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE:$FM_TREEHOUSE_LEASE_PROCESS_PROOF" in
+        helper-ready:complete|running:complete|finished:complete|finished:helper-only)
+          acquisition_proven=1
+          ;;
+      esac
+      ;;
+    legacy)
+      [ "$FM_TREEHOUSE_LEASE_PHASE" = intent ] || acquisition_proven=1
+      ;;
+  esac
+  process_snapshot="$FM_TREEHOUSE_LEASE_PHASE|$FM_TREEHOUSE_LEASE_ACQUISITION_STATE|$FM_TREEHOUSE_LEASE_ACQUISITION_PID|$FM_TREEHOUSE_LEASE_ACQUISITION_IDENTITY|$FM_TREEHOUSE_LEASE_REQUEST_PID|$FM_TREEHOUSE_LEASE_REQUEST_IDENTITY"
+  fm_treehouse_lease_journal_load "$journal" "$task_id" || {
+    echo "error: Treehouse lease recovery journal became malformed while confirming process completion: $journal" >&2
+    return 1
+  }
+  [ "$FM_TREEHOUSE_LEASE_HOME" = "$expected_home" ] || {
+    echo "error: Treehouse lease recovery journal for $task_id changed homes during recovery" >&2
+    return 1
+  }
+  refreshed_snapshot="$FM_TREEHOUSE_LEASE_PHASE|$FM_TREEHOUSE_LEASE_ACQUISITION_STATE|$FM_TREEHOUSE_LEASE_ACQUISITION_PID|$FM_TREEHOUSE_LEASE_ACQUISITION_IDENTITY|$FM_TREEHOUSE_LEASE_REQUEST_PID|$FM_TREEHOUSE_LEASE_REQUEST_IDENTITY"
+  if [ "$refreshed_snapshot" != "$process_snapshot" ]; then
+    recover_treehouse_lease_journal "$journal" "$task_id" "$expected_home" "$force"
+    return $?
   fi
+  [ "$acquisition_proven" = 1 ] || {
+    echo "REFUSED: Treehouse acquisition completion for $task_id cannot be proven from this journal; preserving $journal for later or manual reconciliation" >&2
+    return 1
+  }
   case "$FM_TREEHOUSE_LEASE_PHASE" in
     acquired|published)
       [ "$force" = --force ] || {
@@ -434,16 +458,7 @@ recover_treehouse_lease_journal() {  # <journal> <task-id> <expected-home> <forc
   }
   match_count=${match_record%%$'\t'*}
   if [ "$match_count" = 0 ]; then
-    if [ "$FM_TREEHOUSE_LEASE_PHASE" = intent ] \
-       && [ "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" = legacy ]; then
-      echo "REFUSED: legacy Treehouse acquisition intent for $task_id has no helper identity proving the request is finished; preserve $journal for manual reconciliation" >&2
-      return 1
-    fi
-    if [ "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" = running ] \
-       && [ "$acquisition_helper_dead" != 1 ]; then
-      echo "REFUSED: Treehouse acquisition state for $task_id is not settled; preserving $journal" >&2
-      return 1
-    fi
+    rm -f -- "$journal.request-output.$FM_TREEHOUSE_LEASE_ACQUISITION_PID"
     fm_treehouse_lease_journal_remove "$journal" || return 1
     echo "teardown $task_id complete (no active Treehouse lease remained)"
     return 0
@@ -483,6 +498,7 @@ EOF
     echo "error: treehouse return failed while recovering lease journal $journal" >&2
     return 1
   }
+  rm -f -- "$journal.request-output.$FM_TREEHOUSE_LEASE_ACQUISITION_PID"
   fm_treehouse_lease_journal_remove "$journal" || {
     echo "warning: Treehouse lease returned, but redundant recovery journal remains at $journal" >&2
   }
@@ -2889,7 +2905,7 @@ cleanup_firstmate_home_children() {
       fm_treehouse_lease_journal_write "$child_journal" "$child_id" "$home" \
         "$child_proj" "$child_backend" "$child_t" "$child_lease_holder" cleanup \
         "$child_wt" "$child_lease_id" "$child_lease_holder" \
-        not-applicable "" "" || {
+        not-applicable "" "" "" "" || {
         echo "error: could not publish final Treehouse lease recovery state for child $child_id" >&2
         return 1
       }
@@ -3250,7 +3266,7 @@ if [ "$TREEHOUSE_LEASED" = 1 ]; then
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" cleanup \
     "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" \
-    not-applicable "" "" || {
+    not-applicable "" "" "" "" || {
     echo "error: could not publish final Treehouse lease recovery state for $ID; retaining the lease and task record" >&2
     exit 1
   }
