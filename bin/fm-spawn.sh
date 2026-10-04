@@ -2796,7 +2796,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   }
   TREEHOUSE_LEASE_GATE="$TREEHOUSE_LEASE_JOURNAL.acquire-go"
   rm -rf -- "$TREEHOUSE_LEASE_GATE"
-  TREEHOUSE_LEASE_PARENT_PID=$(fm_current_pid)
+  TREEHOUSE_LEASE_PARENT_PID=${BASHPID:-$$}
   TREEHOUSE_LEASE_PARENT_IDENTITY=$(fm_treehouse_process_start_identity "$TREEHOUSE_LEASE_PARENT_PID") || {
     echo "error: could not identify the spawn process before Treehouse lease acquisition for task $ID" >&2
     exit 1
