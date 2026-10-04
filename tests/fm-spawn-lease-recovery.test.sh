@@ -4,9 +4,9 @@
 # Every case uses fake tmux and Treehouse commands, an explicit tmux backend,
 # no ambient runtime markers, and a temporary FM_HOME. A failure after
 # `treehouse get` must leave a durable journal that fm-teardown can reconcile.
-# The process-crash case also blocks a fake get after its helper identity is
-# durable, kills only the parent spawn, and proves recovery preserves the
-# journal until that exact helper finishes.
+# The process-crash cases exercise parent-published helper identity through
+# /bin/bash, including macOS Bash 3.2, and prove recovery preserves the journal
+# while either the exact helper or request remains alive.
 # No test launches a real harness, touches a real Treehouse pool, or uses the
 # network.
 set -u
@@ -18,6 +18,7 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-lease-recovery)
 REAL_MV=$(command -v mv)
+REAL_RMDIR=$(command -v rmdir)
 
 make_case() {  # <name> <task-id>
   local name=$1 id=$2 case_dir home project worktree fakebin
@@ -57,6 +58,8 @@ case "${1:-}" in
        && grep -Fxq 'phase=intent' "$FM_FAKE_JOURNAL"; then
       printf '%s\n' intent-before-get >> "${FM_FAKE_TREEHOUSE_LOG:?}"
     fi
+    printf '%s\n' "$$" > "${FM_FAKE_REQUEST_PID:?}"
+    printf '%s\n' "$PPID" > "${FM_FAKE_REQUEST_PARENT_PID:?}"
     case "${FM_FAKE_FAILURE_MODE:?}" in
       slow)
         printf '%s\n' "$$" > "${FM_FAKE_SLOW_REQUEST_PID:?}"
@@ -125,15 +128,39 @@ SH
   cat > "$fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
+source_path=
 last=
-for arg in "$@"; do last=$arg; done
+for arg in "$@"; do source_path=$last; last=$arg; done
 if [ "${FM_FAKE_FAILURE_MODE:-}" = meta-publish ] \
    && [ "$last" = "$FM_FAKE_STATE/$FM_FAKE_TASK_ID.meta" ]; then
   exit 1
 fi
+if [ "${FM_FAKE_FAILURE_MODE:-}" = prepublish-pause ] \
+   && [ "$last" = "$FM_FAKE_JOURNAL" ] \
+   && [ -f "$source_path" ] \
+   && /usr/bin/grep -Fxq 'phase=observed' "$source_path"; then
+  : > "${FM_FAKE_OBSERVED_PENDING:?}"
+  while [ ! -f "${FM_FAKE_OBSERVED_RELEASE:?}" ]; do
+    /bin/sleep 0.05
+  done
+fi
 exec "$FM_REAL_MV" "$@"
 SH
-  chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/sleep" "$fakebin/mv"
+  cat > "$fakebin/rmdir" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${FM_FAKE_FAILURE_MODE:-}" = helper-ready-pause ] \
+   && [ "${1:-}" = "$FM_FAKE_JOURNAL.acquire-go" ]; then
+  printf '%s\n' "$PPID" > "${FM_FAKE_HELPER_READY_PID:?}"
+  printf '%s\n' "$$" > "${FM_FAKE_HELPER_READY_RMDIR_PID:?}"
+  : > "${FM_FAKE_HELPER_READY_PENDING:?}"
+  while [ ! -f "${FM_FAKE_HELPER_READY_RELEASE:?}" ]; do
+    /bin/sleep 0.05
+  done
+fi
+exec "$FM_REAL_RMDIR" "$@"
+SH
+  chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/sleep" "$fakebin/mv" "$fakebin/rmdir"
   printf '%s\n' "$case_dir|$home|$project|$worktree|$fakebin"
 }
 
@@ -156,6 +183,15 @@ EOF
       FM_FAKE_EXPECTED_HOLDER="$id@$home" \
       FM_FAKE_JOURNAL="$home/state/$id.treehouse-lease" \
       FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_REQUEST_PID="$case_dir/request.pid" \
+      FM_FAKE_REQUEST_PARENT_PID="$case_dir/request.parent-pid" \
+      FM_FAKE_OBSERVED_PENDING="$case_dir/observed.pending" \
+      FM_FAKE_OBSERVED_RELEASE="$case_dir/observed.release" \
+      FM_FAKE_HELPER_READY_PID="$case_dir/helper-ready.pid" \
+      FM_FAKE_HELPER_READY_RMDIR_PID="$case_dir/helper-ready-rmdir.pid" \
+      FM_FAKE_HELPER_READY_PENDING="$case_dir/helper-ready.pending" \
+      FM_FAKE_HELPER_READY_RELEASE="$case_dir/helper-ready.release" \
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
@@ -182,6 +218,16 @@ EOF
       FM_FAKE_STATUS_PATH="$status_path" \
       FM_FAKE_EXPECTED_HOLDER="$id@$home" \
       FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" \
+      FM_REAL_MV="$REAL_MV" FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_JOURNAL="$home/state/$id.treehouse-lease" \
+      FM_FAKE_REQUEST_PID="$case_dir/request.pid" \
+      FM_FAKE_REQUEST_PARENT_PID="$case_dir/request.parent-pid" \
+      FM_FAKE_OBSERVED_PENDING="$case_dir/observed.pending" \
+      FM_FAKE_OBSERVED_RELEASE="$case_dir/observed.release" \
+      FM_FAKE_HELPER_READY_PID="$case_dir/helper-ready.pid" \
+      FM_FAKE_HELPER_READY_RMDIR_PID="$case_dir/helper-ready-rmdir.pid" \
+      FM_FAKE_HELPER_READY_PENDING="$case_dir/helper-ready.pending" \
+      FM_FAKE_HELPER_READY_RELEASE="$case_dir/helper-ready.release" \
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
@@ -303,6 +349,9 @@ EOF
       FM_FAKE_WORKTREE="$worktree" FM_FAKE_TREEHOUSE_PATH="$worktree" \
       FM_FAKE_EXPECTED_HOLDER="$id@$home" FM_FAKE_JOURNAL="$journal" \
       FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_REQUEST_PID="$case_dir/request.pid" \
+      FM_FAKE_REQUEST_PARENT_PID="$case_dir/request.parent-pid" \
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
@@ -361,7 +410,7 @@ EOF
 }
 
 test_request_survives_helper_crash_without_losing_journal() {
-  local id record case_dir home project worktree fakebin journal out rc spawn_pid helper_pid request_pid returns
+  local id record case_dir home project worktree fakebin journal out rc spawn_pid helper_pid request_pid actual_helper returns
   id=lease-helper-crash
   record=$(make_case helper-crash "$id")
   IFS='|' read -r case_dir home project worktree fakebin <<EOF
@@ -378,6 +427,9 @@ EOF
       FM_FAKE_WORKTREE="$worktree" FM_FAKE_TREEHOUSE_PATH="$worktree" \
       FM_FAKE_EXPECTED_HOLDER="$id@$home" FM_FAKE_JOURNAL="$journal" \
       FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_REQUEST_PID="$case_dir/request.pid" \
+      FM_FAKE_REQUEST_PARENT_PID="$case_dir/request.parent-pid" \
       FM_FAKE_SLOW_STARTED="$case_dir/slow.started" \
       FM_FAKE_SLOW_RELEASE="$case_dir/slow.release" \
       FM_FAKE_SLOW_LEASE="$case_dir/slow.lease" \
@@ -396,8 +448,13 @@ EOF
     "helper-crash: request process identity was not durable before get"
   helper_pid=$(sed -n 's/^acquisition_pid=//p' "$journal")
   request_pid=$(sed -n 's/^request_pid=//p' "$journal")
+  actual_helper=$(cat "$case_dir/request.parent-pid")
   [ "$request_pid" = "$(cat "$case_dir/slow.request-pid")" ] \
     || fail "helper-crash: journal did not identify the actual Treehouse request process"
+  [ "$helper_pid" = "$actual_helper" ] \
+    || fail "helper-crash: journal did not identify the request's actual parent helper"
+  [ "$helper_pid" != "$spawn_pid" ] \
+    || fail "helper-crash: journal confused the spawn parent with the acquisition helper"
 
   kill -KILL "$spawn_pid"
   wait "$spawn_pid" 2>/dev/null || true
@@ -437,6 +494,155 @@ EOF
   returns=$(grep -c '^return ' "$case_dir/treehouse.log" 2>/dev/null || true)
   [ "$returns" -eq 1 ] || fail "helper-crash: exact recovery returned the lease $returns times"
   pass "a Treehouse request that outlives its helper retains recoverable ownership"
+}
+
+test_bash32_helper_identity_survives_prepublication_pause() {
+  local id record case_dir home project worktree fakebin journal out rc
+  local spawn_pid helper_pid actual_helper request_pid
+  id=lease-bash32-helper-identity
+  record=$(make_case bash32-helper-identity "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    exec env FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+      FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_SPAWN_NO_GUARD=1 \
+      FM_FAKE_FAILURE_MODE=prepublish-pause FM_FAKE_TASK_ID="$id" \
+      FM_FAKE_STATE="$home/state" FM_FAKE_PROJECT="$project" \
+      FM_FAKE_WORKTREE="$worktree" FM_FAKE_TREEHOUSE_PATH="$worktree" \
+      FM_FAKE_EXPECTED_HOLDER="$id@$home" FM_FAKE_JOURNAL="$journal" \
+      FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_REQUEST_PID="$case_dir/request.pid" \
+      FM_FAKE_REQUEST_PARENT_PID="$case_dir/request.parent-pid" \
+      FM_FAKE_OBSERVED_PENDING="$case_dir/observed.pending" \
+      FM_FAKE_OBSERVED_RELEASE="$case_dir/observed.release" \
+      PATH="$fakebin:$PATH" \
+      /bin/bash "$SPAWN" "$id" "$project" --mode no-mistakes --yolo off
+  ) > "$case_dir/spawn.out" 2>&1 &
+  spawn_pid=$!
+
+  for _ in $(seq 1 300); do
+    [ -f "$case_dir/observed.pending" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    /bin/sleep 0.01
+  done
+  assert_present "$case_dir/observed.pending" \
+    "bash32-helper-identity: helper never paused before observed publication"
+  assert_grep 'phase=intent' "$journal" \
+    "bash32-helper-identity: prepublication journal did not remain at intent"
+  assert_grep 'acquisition_state=running' "$journal" \
+    "bash32-helper-identity: prepublication journal did not retain running process proof"
+  helper_pid=$(sed -n 's/^acquisition_pid=//p' "$journal")
+  request_pid=$(cat "$case_dir/request.pid")
+  actual_helper=$(cat "$case_dir/request.parent-pid")
+  [ "$helper_pid" = "$actual_helper" ] \
+    || fail "bash32-helper-identity: /bin/bash recorded $helper_pid instead of actual helper $actual_helper"
+  [ "$helper_pid" != "$spawn_pid" ] \
+    || fail "bash32-helper-identity: /bin/bash recorded the spawn parent as the helper"
+  kill -0 "$helper_pid" 2>/dev/null \
+    || fail "bash32-helper-identity: actual helper was not live at the publication pause"
+  kill -0 "$request_pid" 2>/dev/null \
+    && fail "bash32-helper-identity: request was still live after the helper had reaped it"
+
+  kill -KILL "$spawn_pid"
+  wait "$spawn_pid" 2>/dev/null || true
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  [ "$rc" -ne 0 ] || fail "bash32-helper-identity: recovery removed a journal while its helper was live"
+  assert_contains "$out" "exact helper pid $helper_pid" \
+    "bash32-helper-identity: recovery did not name the live helper"
+  assert_present "$journal" \
+    "bash32-helper-identity: refused recovery removed the running journal"
+
+  : > "$case_dir/observed.release"
+  for _ in $(seq 1 300); do
+    grep -Fxq 'phase=observed' "$journal" 2>/dev/null \
+      && ! kill -0 "$helper_pid" 2>/dev/null && break
+    /bin/sleep 0.01
+  done
+  assert_grep 'phase=observed' "$journal" \
+    "bash32-helper-identity: helper did not finish observed publication"
+  kill -0 "$helper_pid" 2>/dev/null \
+    && fail "bash32-helper-identity: helper remained live after observed publication"
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  expect_code 0 "$rc" "bash32-helper-identity: observed lease recovery should succeed"
+  assert_absent "$journal" \
+    "bash32-helper-identity: successful recovery left its journal"
+  pass "/bin/bash helper identity survives the request-exited prepublication window"
+}
+
+test_helper_ready_crash_is_recoverable() {
+  local id record case_dir home project worktree fakebin journal out rc
+  local spawn_pid helper_pid journal_helper rmdir_pid
+  id=lease-helper-ready-crash
+  record=$(make_case helper-ready-crash "$id")
+  IFS='|' read -r case_dir home project worktree fakebin <<EOF
+$record
+EOF
+  journal="$home/state/$id.treehouse-lease"
+  (
+    unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+    exec env FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+      FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_SPAWN_NO_GUARD=1 \
+      FM_FAKE_FAILURE_MODE=helper-ready-pause FM_FAKE_TASK_ID="$id" \
+      FM_FAKE_STATE="$home/state" FM_FAKE_PROJECT="$project" \
+      FM_FAKE_WORKTREE="$worktree" FM_FAKE_TREEHOUSE_PATH="$worktree" \
+      FM_FAKE_EXPECTED_HOLDER="$id@$home" FM_FAKE_JOURNAL="$journal" \
+      FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" FM_REAL_MV="$REAL_MV" \
+      FM_REAL_RMDIR="$REAL_RMDIR" \
+      FM_FAKE_HELPER_READY_PID="$case_dir/helper-ready.pid" \
+      FM_FAKE_HELPER_READY_RMDIR_PID="$case_dir/helper-ready-rmdir.pid" \
+      FM_FAKE_HELPER_READY_PENDING="$case_dir/helper-ready.pending" \
+      FM_FAKE_HELPER_READY_RELEASE="$case_dir/helper-ready.release" \
+      PATH="$fakebin:$PATH" \
+      /bin/bash "$SPAWN" "$id" "$project" --mode no-mistakes --yolo off
+  ) > "$case_dir/spawn.out" 2>&1 &
+  spawn_pid=$!
+
+  for _ in $(seq 1 300); do
+    [ -f "$case_dir/helper-ready.pending" ] && break
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    /bin/sleep 0.01
+  done
+  assert_present "$case_dir/helper-ready.pending" \
+    "helper-ready: helper never paused at the executable helper-ready state"
+  assert_grep 'acquisition_state=helper-ready' "$journal" \
+    "helper-ready: journal did not publish helper-ready before opening its gate"
+  helper_pid=$(cat "$case_dir/helper-ready.pid")
+  journal_helper=$(sed -n 's/^acquisition_pid=//p' "$journal")
+  [ "$journal_helper" = "$helper_pid" ] \
+    || fail "helper-ready: journal did not identify the actual gated helper"
+  [ "$helper_pid" != "$spawn_pid" ] \
+    || fail "helper-ready: journal confused the spawn parent with its helper"
+
+  rmdir_pid=$(cat "$case_dir/helper-ready-rmdir.pid")
+  kill -KILL "$spawn_pid"
+  wait "$spawn_pid" 2>/dev/null || true
+  kill -KILL "$helper_pid" 2>/dev/null || true
+  : > "$case_dir/helper-ready.release"
+  for _ in $(seq 1 200); do
+    ! kill -0 "$helper_pid" 2>/dev/null \
+      && ! kill -0 "$rmdir_pid" 2>/dev/null && break
+    /bin/sleep 0.01
+  done
+  kill -0 "$helper_pid" 2>/dev/null \
+    && fail "helper-ready: killed helper remained live"
+  kill -0 "$rmdir_pid" 2>/dev/null \
+    && fail "helper-ready: gate-removal stub remained live"
+  : > "$case_dir/slow.started"
+  rc=0
+  out=$(run_recovery "$record" "$id" "") || rc=$?
+  expect_code 0 "$rc" "helper-ready: empty holder recovery should succeed"
+  assert_absent "$journal" "helper-ready: successful recovery left its journal"
+  assert_contains "$out" "no active Treehouse lease remained" \
+    "helper-ready: recovery did not report the empty holder state"
+  pass "helper-ready crash is exercised and recovered through the executable interface"
 }
 
 test_crash_point_before_get_is_safe() {
@@ -542,6 +748,8 @@ test_existing_recovery_journal_is_never_replaced
 test_crash_point_before_get_is_safe
 test_inflight_acquisition_survives_parent_spawn_crash
 test_request_survives_helper_crash_without_losing_journal
+test_bash32_helper_identity_survives_prepublication_pause
+test_helper_ready_crash_is_recoverable
 test_crash_point_after_get_before_meta_is_safe
 test_crash_point_after_meta_requires_force
 test_legacy_intent_without_helper_identity_is_preserved

@@ -20,8 +20,10 @@
 #                                                       then confirm holder state.
 # During get                  intent:running             Preserve while either exact
 #                                                       process remains alive.
-# After get, before meta      settled or observed        After both exact processes are
-#                                                       gone, reconcile holder state.
+# After get, before meta      intent:running, then       Preserve while the helper is
+#                             settled or observed        publishing; after both exact
+#                                                       processes are gone, reconcile
+#                                                       holder state.
 # After meta publication      published, then cleanup    Require --force for journal-only
 #                                                       recovery and return exact identity.
 # A v2 running intent lacks request-process identity and a v1 intent lacks all

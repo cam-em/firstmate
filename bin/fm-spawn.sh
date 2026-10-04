@@ -831,14 +831,27 @@ treehouse_lease_acquire_helper() {  # <journal> <project> <target> <holder> <gat
   local journal=$1 project=$2 target=$3 holder=$4 gate=$5 parent_pid=$6 parent_identity=$7
   local current_parent current_helper lease_json lease_record worktree lease_id reported_holder
   local helper_pid helper_identity request_pid request_identity request_gate request_output request_status
-  helper_pid=${BASHPID:-$$}
-  helper_identity=$(fm_treehouse_process_start_identity "$helper_pid") || return 70
   while [ ! -d "$gate" ]; do
     current_parent=$(fm_treehouse_process_start_identity "$parent_pid" 2>/dev/null) || return 70
     [ "$current_parent" = "$parent_identity" ] || return 70
     sleep 0.05
   done
   rmdir "$gate" 2>/dev/null || return 70
+  fm_treehouse_lease_journal_load "$journal" "$ID" || return 70
+  [ "$FM_TREEHOUSE_LEASE_PHASE" = intent ] \
+    && [ "$FM_TREEHOUSE_LEASE_ACQUISITION_STATE" = helper-ready ] \
+    && [ "$FM_TREEHOUSE_LEASE_PROCESS_PROOF" = complete ] \
+    && [ "$FM_TREEHOUSE_LEASE_HOME" = "$FM_HOME" ] \
+    && [ "$FM_TREEHOUSE_LEASE_PROJECT" = "$project" ] \
+    && [ "$FM_TREEHOUSE_LEASE_BACKEND" = "$BACKEND" ] \
+    && [ "$FM_TREEHOUSE_LEASE_TARGET" = "$target" ] \
+    && [ "$FM_TREEHOUSE_LEASE_REQUESTED_HOLDER" = "$holder" ] \
+    && [ -z "$FM_TREEHOUSE_LEASE_REQUEST_PID" ] \
+    && [ -z "$FM_TREEHOUSE_LEASE_REQUEST_IDENTITY" ] || return 70
+  helper_pid=$FM_TREEHOUSE_LEASE_ACQUISITION_PID
+  helper_identity=$FM_TREEHOUSE_LEASE_ACQUISITION_IDENTITY
+  current_helper=$(fm_treehouse_process_start_identity "$helper_pid" 2>/dev/null) || return 70
+  [ "$current_helper" = "$helper_identity" ] || return 70
   request_gate="$journal.request-go.$helper_pid"
   request_output="$journal.request-output.$helper_pid"
   rm -rf -- "$request_gate"
