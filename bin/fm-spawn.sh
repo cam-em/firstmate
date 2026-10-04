@@ -165,8 +165,10 @@
 #   relaunch reuses the same recorded worktree and lease without acquiring a new
 #   slot. Before acquisition, state/<id>.treehouse-lease atomically records the
 #   intended holder and project; it advances with any observed lease identity,
-#   survives every failure after the request begins, and is removed only after
-#   the spawn commit. Teardown uses that journal to reconcile interrupted
+#   records the acquisition helper's exact process identity before the request
+#   can begin, survives every failure after the request begins, and is removed
+#   only after the spawn commit. Teardown refuses recovery while that exact
+#   helper remains live, then uses the journal to reconcile interrupted
 #   holder-only or exact-identity acquisition. Legacy records without lease
 #   fields remain readable and are never upgraded by resetting or reacquiring
 #   their copy; teardown owns their safe no-return migration behavior.
@@ -792,6 +794,8 @@ TREEHOUSE_LEASE_HOLDER=
 TREEHOUSE_LEASE_JOURNAL=
 TREEHOUSE_LEASE_JOURNAL_OWNED=0
 TREEHOUSE_LEASE_REQUESTED=0
+TREEHOUSE_LEASE_ACQUISITION_PID=
+TREEHOUSE_LEASE_ACQUISITION_IDENTITY=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -818,6 +822,45 @@ parse_orca_worktree_result() {
   else
     ORCA_TERMINAL=
   fi
+}
+
+treehouse_lease_acquire_helper() {  # <journal> <project> <target> <holder> <gate> <parent-pid> <parent-identity>
+  local journal=$1 project=$2 target=$3 holder=$4 gate=$5 parent_pid=$6 parent_identity=$7
+  local current_parent lease_json lease_record worktree lease_id reported_holder helper_pid helper_identity
+  helper_pid=${BASHPID:-$$}
+  helper_identity=$(fm_pid_identity "$helper_pid") || return 70
+  while [ ! -d "$gate" ]; do
+    current_parent=$(fm_pid_identity "$parent_pid" 2>/dev/null) || return 70
+    [ "$current_parent" = "$parent_identity" ] || return 70
+    sleep 0.05
+  done
+  rmdir "$gate" 2>/dev/null || return 70
+  if ! lease_json=$(cd "$project" \
+      && treehouse get --lease --json --lease-holder "$holder"); then
+    fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
+      "$project" "$BACKEND" "$target" "$holder" settled "" "" "" \
+      finished "$helper_pid" "$helper_identity" || return 71
+    return 1
+  fi
+  if ! lease_record=$(printf '%s\n' "$lease_json" | jq -cer '
+      if type == "object" then
+        {path: (.path | if type == "string" then . else "" end),
+         lease_id: (.lease_id | if type == "string" then . else "" end),
+         lease_holder: (.lease_holder | if type == "string" then . else "" end)}
+      else error("lease result is not an object") end
+    '); then
+    fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
+      "$project" "$BACKEND" "$target" "$holder" settled "" "" "" \
+      finished "$helper_pid" "$helper_identity" || return 71
+    return 2
+  fi
+  worktree=$(printf '%s\n' "$lease_record" | jq -r '.path')
+  lease_id=$(printf '%s\n' "$lease_record" | jq -r '.lease_id')
+  reported_holder=$(printf '%s\n' "$lease_record" | jq -r '.lease_holder')
+  fm_treehouse_lease_journal_write "$journal" "$ID" "$FM_HOME" \
+    "$project" "$BACKEND" "$target" "$holder" observed \
+    "$worktree" "$lease_id" "$reported_holder" finished \
+    "$helper_pid" "$helper_identity" || return 71
 }
 
 spawn_abort_cleanup() {
@@ -2318,7 +2361,8 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ];
   fi
   TREEHOUSE_LEASE_HOLDER="$ID@$FM_HOME"
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
-    "$PROJ_ABS" "$BACKEND" "" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" || {
+    "$PROJ_ABS" "$BACKEND" "" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
+    not-started "" "" || {
     echo "error: could not publish Treehouse lease intent for task $ID before acquisition" >&2
     exit 1
   }
@@ -2693,35 +2737,66 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
-    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" || {
+    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
+    not-started "" "" || {
     echo "error: could not bind Treehouse lease intent to endpoint $T for task $ID" >&2
     exit 1
   }
+  TREEHOUSE_LEASE_GATE="$TREEHOUSE_LEASE_JOURNAL.acquire-go"
+  rm -rf -- "$TREEHOUSE_LEASE_GATE"
+  TREEHOUSE_LEASE_PARENT_PID=$(fm_current_pid)
+  TREEHOUSE_LEASE_PARENT_IDENTITY=$(fm_pid_identity "$TREEHOUSE_LEASE_PARENT_PID") || {
+    echo "error: could not identify the spawn process before Treehouse lease acquisition for task $ID" >&2
+    exit 1
+  }
+  treehouse_lease_acquire_helper "$TREEHOUSE_LEASE_JOURNAL" "$PROJ_ABS" "$T" \
+    "$TREEHOUSE_LEASE_HOLDER" "$TREEHOUSE_LEASE_GATE" \
+    "$TREEHOUSE_LEASE_PARENT_PID" "$TREEHOUSE_LEASE_PARENT_IDENTITY" &
+  TREEHOUSE_LEASE_ACQUISITION_PID=$!
+  TREEHOUSE_LEASE_ACQUISITION_IDENTITY=$(fm_pid_identity "$TREEHOUSE_LEASE_ACQUISITION_PID") || {
+    kill "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    wait "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    echo "error: could not identify the Treehouse acquisition helper for task $ID" >&2
+    exit 1
+  }
   TREEHOUSE_LEASE_REQUESTED=1
-  if ! TREEHOUSE_LEASE_JSON=$(cd "$PROJ_ABS" \
-      && treehouse get --lease --json --lease-holder "$TREEHOUSE_LEASE_HOLDER"); then
+  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
+    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" intent "" "" "" \
+    running "$TREEHOUSE_LEASE_ACQUISITION_PID" \
+    "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
+    kill "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    wait "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    echo "error: could not publish the Treehouse acquisition helper identity for task $ID" >&2
+    exit 1
+  }
+  mkdir "$TREEHOUSE_LEASE_GATE" || {
+    kill "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    wait "$TREEHOUSE_LEASE_ACQUISITION_PID" 2>/dev/null || true
+    echo "error: could not release the Treehouse acquisition helper for task $ID" >&2
+    exit 1
+  }
+  TREEHOUSE_LEASE_HELPER_STATUS=0
+  wait "$TREEHOUSE_LEASE_ACQUISITION_PID" || TREEHOUSE_LEASE_HELPER_STATUS=$?
+  fm_treehouse_lease_journal_load "$TREEHOUSE_LEASE_JOURNAL" "$ID" || {
+    echo "error: Treehouse acquisition helper for task $ID left a malformed recovery journal" >&2
+    exit 1
+  }
+  if [ "$TREEHOUSE_LEASE_HELPER_STATUS" -eq 1 ]; then
     echo "error: treehouse could not lease a worktree for task $ID" >&2
     exit 1
   fi
-  if ! TREEHOUSE_LEASE_RECORD=$(printf '%s\n' "$TREEHOUSE_LEASE_JSON" | jq -cer '
-      if type == "object" then
-        {path: (.path | if type == "string" then . else "" end),
-         lease_id: (.lease_id | if type == "string" then . else "" end),
-         lease_holder: (.lease_holder | if type == "string" then . else "" end)}
-      else error("lease result is not an object") end
-    '); then
+  if [ "$TREEHOUSE_LEASE_HELPER_STATUS" -eq 2 ]; then
     echo "error: treehouse leased a worktree for task $ID but returned malformed lease metadata; the lease holder is '$TREEHOUSE_LEASE_HOLDER' and must be reconciled before retrying" >&2
     exit 1
   fi
-  WT=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.path')
-  TREEHOUSE_LEASE_ID=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.lease_id')
-  TREEHOUSE_REPORTED_HOLDER=$(printf '%s\n' "$TREEHOUSE_LEASE_RECORD" | jq -r '.lease_holder')
-  fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
-    "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" observed \
-    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" || {
-    echo "error: treehouse leased a worktree for task $ID but its observed identity could not be journaled; reconcile holder '$TREEHOUSE_LEASE_HOLDER' before retrying" >&2
+  if [ "$TREEHOUSE_LEASE_HELPER_STATUS" -ne 0 ] \
+     || [ "$FM_TREEHOUSE_LEASE_PHASE" != observed ]; then
+    echo "error: Treehouse acquisition helper failed before it could durably record the result for task $ID; reconcile holder '$TREEHOUSE_LEASE_HOLDER' before retrying" >&2
     exit 1
-  }
+  fi
+  WT=$FM_TREEHOUSE_LEASE_WORKTREE
+  TREEHOUSE_LEASE_ID=$FM_TREEHOUSE_LEASE_ID
+  TREEHOUSE_REPORTED_HOLDER=$FM_TREEHOUSE_LEASE_HOLDER
   if [ -z "$WT" ] || [ -z "$TREEHOUSE_LEASE_ID" ] || [ -z "$TREEHOUSE_REPORTED_HOLDER" ]; then
     echo "error: treehouse leased a worktree for task $ID but returned incomplete lease metadata; the journal at $TREEHOUSE_LEASE_JOURNAL must be reconciled before retrying" >&2
     exit 1
@@ -2739,7 +2814,8 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   esac
   fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
     "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" acquired \
-    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" || {
+    "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_REPORTED_HOLDER" finished \
+    "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
     echo "error: treehouse lease identity for task $ID could not be committed to its recovery journal" >&2
     exit 1
   }
@@ -3319,7 +3395,8 @@ if [ "$RELAUNCH" -eq 0 ]; then
   if [ -n "$TREEHOUSE_LEASE_JOURNAL" ]; then
     fm_treehouse_lease_journal_write "$TREEHOUSE_LEASE_JOURNAL" "$ID" "$FM_HOME" \
       "$PROJ_ABS" "$BACKEND" "$T" "$TREEHOUSE_LEASE_HOLDER" published \
-      "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" || {
+      "$WT" "$TREEHOUSE_LEASE_ID" "$TREEHOUSE_LEASE_HOLDER" finished \
+      "$TREEHOUSE_LEASE_ACQUISITION_PID" "$TREEHOUSE_LEASE_ACQUISITION_IDENTITY" || {
       echo "error: task record for $ID was published but its Treehouse recovery journal could not advance; rolling the provisional task record back" >&2
       exit 1
     }
