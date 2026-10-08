@@ -1306,7 +1306,7 @@ heartbeat_scan_finds_actionable() {
 # supervision cycle: the reader is a short-lived subprocess of THIS watcher, not
 # a second watcher, so every guard/beacon/arm/turn-end mechanism is unchanged.
 event_wait_or_sleep() {
-  local w b session first_backend="" first_session="" rec rc
+  local w b session first_backend="" first_session="" rec rc wait_budget
   local windows=()
   while IFS= read -r w; do
     b=$(window_backend "$w")
@@ -1348,7 +1348,12 @@ event_wait_or_sleep() {
     return
   fi
 
-  rec=$(FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition "$first_backend" "$first_session" "$POLL" "$STATE" "${windows[@]}")
+  # The watcher's beacon is touched once per cycle. Bound the native event wait
+  # so a long poll setting cannot leave that beacon stale while the subscriber
+  # blocks; each clean timeout returns through the normal scan and beacon touch.
+  wait_budget=$POLL
+  [ "$wait_budget" -le 60 ] || wait_budget=60
+  rec=$(FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition "$first_backend" "$first_session" "$wait_budget" "$STATE" "${windows[@]}")
   rc=$?
   case "$rc" in
     0)
@@ -1357,11 +1362,11 @@ event_wait_or_sleep() {
       ;;
     2)
       # Event path unusable this cycle (connect/subscribe failure). Sleep the
-      # budget and count toward the runtime-disable threshold; past it, drop to
-      # pure polling for the rest of this watcher process.
+      # bounded budget and count toward the runtime-disable threshold; past it,
+      # drop to pure polling for the rest of this watcher process.
       _event_cap_fails=$((_event_cap_fails + 1))
       [ "$_event_cap_fails" -ge "$EVENT_CAP_FAIL_MAX" ] && _event_cap_ok=0
-      sleep "$POLL"
+      sleep "$wait_budget"
       ;;
     *)
       # 1: a clean full-budget wait with no actionable edge - the reader already

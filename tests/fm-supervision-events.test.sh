@@ -14,7 +14,9 @@ set -u
 
 TMP=$(fm_test_tmproot fm-supervision-events)
 STATE_DIR="$TMP/state"
-mkdir -p "$STATE_DIR"
+export FM_HOME="$TMP/home"
+unset HERDR_ENV HERDR_PANE_ID HERDR_SESSION TMUX TMUX_PANE
+mkdir -p "$STATE_DIR" "$FM_HOME"
 
 # Source the watcher with an isolated state/home. The guard returns before the
 # lock/loop, so only the functions load.
@@ -29,7 +31,7 @@ export FM_ROOT_OVERRIDE="$ROOT"
 WAKE_LOG="$TMP/wakes"
 SLEEP_LOG="$TMP/sleeps"
 wake() { printf '%s\n' "$1" >> "$WAKE_LOG"; return 0; }
-sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
+sleep() { printf 'SLEEP:%s\n' "$1" >> "$SLEEP_LOG"; }
 
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
@@ -124,6 +126,37 @@ event_wait_or_sleep
 event_wait_or_sleep
 [ "$CAP_CALLS" = 1 ] || fail "capability probe must be memoized across waits, got $CAP_CALLS calls"
 pass "event_wait_or_sleep: one cached capability probe owns validation across bounded waits"
+
+# --- event_wait_or_sleep: long event waits return through the beacon cycle ----
+
+reset_state
+fm_write_meta "$STATE_DIR/tk-long-poll.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+POLL=960
+# shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
+fm_backend_wait_transition() {
+  printf '%s\n' "$3" > "$TMP/wait-timeout"
+  return 1
+}
+event_wait_or_sleep
+[ "$(cat "$TMP/wait-timeout")" = 60 ] || fail "a long Herdr event wait must be capped at 60 seconds, got '$(cat "$TMP/wait-timeout")'"
+[ ! -s "$SLEEP_LOG" ] || fail "a clean bounded event timeout must continue straight to the next beacon cycle"
+POLL=15
+rm -f "$TMP/wait-timeout"
+event_wait_or_sleep
+[ "$(cat "$TMP/wait-timeout")" = 15 ] || fail "a short Herdr event wait must retain the poll budget, got '$(cat "$TMP/wait-timeout")'"
+pass "event_wait_or_sleep: long Herdr waits return at most every 60 seconds while short waits preserve the poll budget"
+
+# An unusable event stream sleeps only the same bounded interval, so repeated
+# transient failures cannot starve the beacon before runtime disable engages.
+reset_state
+fm_write_meta "$STATE_DIR/tk-long-poll-failure.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+# shellcheck disable=SC2034 # Read by event_wait_or_sleep in the sourced watcher.
+POLL=960
+# shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
+fm_backend_wait_transition() { return 2; }
+event_wait_or_sleep
+grep -q 'SLEEP:60' "$SLEEP_LOG" || fail "a failed long Herdr wait must sleep only its bounded budget"
+pass "event_wait_or_sleep: a failed long Herdr wait cannot leave the watcher beacon stale"
 
 # --- event_wait_or_sleep: a tmux-only home never runs the event path ----------
 
