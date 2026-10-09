@@ -1299,15 +1299,24 @@ heartbeat_scan_finds_actionable() {
 # bounded wait on the backend's native transition stream, so a crew going
 # `blocked` wakes the supervisor sub-second instead of after the stale-pane
 # wedge timer. For every other home - no push-capable window, backend not
-# capable, or the event path proven unreliable this process - it sleeps POLL,
-# byte-for-byte today's behavior. The poll loop above still runs every cycle, so
-# this only ever SHORTENS latency; it can never drop an escalation (the poll
-# loop is the permanent fail-closed backstop). This preserves the single live
+# capable, or the event path proven unreliable this process - it sleeps the
+# same beacon-safe budget. The poll loop above still runs every cycle, so this
+# only ever SHORTENS latency; it can never drop an escalation (the poll loop is
+# the permanent fail-closed backstop). This preserves the single live
 # supervision cycle: the reader is a short-lived subprocess of THIS watcher, not
 # a second watcher, so every guard/beacon/arm/turn-end mechanism is unchanged.
 event_wait_or_sleep() {
-  local w b session first_backend="" first_session="" rec rc wait_budget
+  local w b session first_backend="" first_session="" rec rc wait_budget poll_whole
   local windows=()
+  # The beacon is touched at the start of each cycle. Bound every terminal
+  # wait, including polling after event-stream failure, so it stays fresh.
+  # sleep and the Herdr wait accept fractional seconds; Bash 3.2's integer
+  # comparison must see only the whole part of a valid decimal poll interval.
+  wait_budget=$POLL
+  poll_whole=${POLL%%.*}
+  if [ "$poll_whole" -ge 60 ] 2>/dev/null; then
+    wait_budget=60
+  fi
   while IFS= read -r w; do
     b=$(window_backend "$w")
     fm_backend_has_push "$b" || continue
@@ -1328,7 +1337,7 @@ event_wait_or_sleep() {
   done < <(recorded_windows)
 
   if [ "${#windows[@]}" -eq 0 ]; then
-    sleep "$POLL"
+    sleep "$wait_budget"
     return
   fi
 
@@ -1344,15 +1353,11 @@ event_wait_or_sleep() {
     _event_cap_fails=0
   fi
   if [ "$_event_cap_ok" != 1 ]; then
-    sleep "$POLL"
+    sleep "$wait_budget"
     return
   fi
 
-  # The watcher's beacon is touched once per cycle. Bound the native event wait
-  # so a long poll setting cannot leave that beacon stale while the subscriber
-  # blocks; each clean timeout returns through the normal scan and beacon touch.
-  wait_budget=$POLL
-  [ "$wait_budget" -le 60 ] || wait_budget=60
+  # Each clean timeout returns through the normal scan and beacon touch.
   rec=$(FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition "$first_backend" "$first_session" "$wait_budget" "$STATE" "${windows[@]}")
   rc=$?
   case "$rc" in

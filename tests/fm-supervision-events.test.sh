@@ -144,7 +144,11 @@ POLL=15
 rm -f "$TMP/wait-timeout"
 event_wait_or_sleep
 [ "$(cat "$TMP/wait-timeout")" = 15 ] || fail "a short Herdr event wait must retain the poll budget, got '$(cat "$TMP/wait-timeout")'"
-pass "event_wait_or_sleep: long Herdr waits return at most every 60 seconds while short waits preserve the poll budget"
+POLL=0.2
+rm -f "$TMP/wait-timeout"
+event_wait_or_sleep
+[ "$(cat "$TMP/wait-timeout")" = 0.2 ] || fail "a fractional Herdr event wait must retain the poll budget, got '$(cat "$TMP/wait-timeout")'"
+pass "event_wait_or_sleep: long Herdr waits return at most every 60 seconds while short and fractional waits preserve the poll budget"
 
 # An unusable event stream sleeps only the same bounded interval, so repeated
 # transient failures cannot starve the beacon before runtime disable engages.
@@ -154,20 +158,35 @@ fm_write_meta "$STATE_DIR/tk-long-poll-failure.meta" "window=default:wG:pQ" "bac
 POLL=960
 # shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
 fm_backend_wait_transition() { return 2; }
+EVENT_CAP_FAIL_MAX=2
+event_wait_or_sleep   # fails=1
+event_wait_or_sleep   # fails=2 -> disable
+event_wait_or_sleep   # disabled event path
+[ "$(cat "$SLEEP_LOG")" = "$(printf 'SLEEP:60\nSLEEP:60\nSLEEP:60')" ] || fail "each failed or disabled event cycle must sleep at most 60 seconds, got '$(cat "$SLEEP_LOG")'"
+pass "event_wait_or_sleep: repeated event failures keep every beacon interval bounded after runtime disable"
+
+reset_state
+fm_write_meta "$STATE_DIR/tk-long-poll-unavailable.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+# shellcheck disable=SC2034 # Read by event_wait_or_sleep in the sourced watcher.
+POLL=960
+# shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
+fm_backend_events_capable() { return 1; }
 event_wait_or_sleep
-grep -q 'SLEEP:60' "$SLEEP_LOG" || fail "a failed long Herdr wait must sleep only its bounded budget"
-pass "event_wait_or_sleep: a failed long Herdr wait cannot leave the watcher beacon stale"
+[ "$(cat "$SLEEP_LOG")" = 'SLEEP:60' ] || fail "an unavailable event capability must sleep at most 60 seconds"
+pass "event_wait_or_sleep: unavailable event capability keeps the beacon interval bounded"
 
 # --- event_wait_or_sleep: a tmux-only home never runs the event path ----------
 
 reset_state
 fm_write_meta "$STATE_DIR/tk4.meta" "window=fmses:fm-tk4" "kind=ship"   # no backend= -> tmux
+# shellcheck disable=SC2034 # Read by event_wait_or_sleep in the sourced watcher.
+POLL=960
 # shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
 fm_backend_wait_transition() { printf 'CALLED\n' > "$TMP/wtcalled"; return 1; }
 event_wait_or_sleep
 [ ! -e "$TMP/wtcalled" ] || fail "a tmux-only home must never invoke the event wait path"
-grep -q 'SLEEP' "$SLEEP_LOG" || fail "a tmux-only home must sleep POLL exactly as before"
-pass "event_wait_or_sleep: a home with no push-capable window is inert (sleeps POLL, never touches the event path)"
+[ "$(cat "$SLEEP_LOG")" = 'SLEEP:60' ] || fail "a tmux-only home must keep a long poll within the beacon budget"
+pass "event_wait_or_sleep: a home with no push-capable window keeps the beacon interval bounded"
 
 # --- event_wait_or_sleep: runtime failures disable the event path (fail-closed)
 
